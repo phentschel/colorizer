@@ -28,3 +28,9 @@ windows = { version = "0.61", features = [
 [profile.release]
 lto = true
 strip = true
+
+# Local copy of eframe 0.32.3 with one fix: its event loop could stay in
+# ControlFlow::Poll forever (100% of a core) when Windows never delivered a
+# redraw, e.g. while an exclusive-fullscreen game covers the window.
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }

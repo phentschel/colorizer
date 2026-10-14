@@ -178,6 +178,17 @@ pub fn label_text(name: &str, weight: u32, median: Option<u32>) -> String {
     }
 }
 
+/// Config position (permille of the screen) for a zone centred at output-local
+/// pixel (`cx`, `cy`) on a `w`x`h` screen. Clamped to the screen; the engine
+/// clamps the zone itself fully on-screen.
+pub fn pos_from_center(cx: i32, cy: i32, w: u32, h: u32) -> (u32, u32) {
+    let f = |v: i32, n: u32| {
+        let n = n.max(1) as i64;
+        (v.clamp(0, n as i32) as i64 * crate::POS_MAX as i64 / n) as u32
+    };
+    (f(cx, w), f(cy, h))
+}
+
 /// Desktop position of the measured output packed into one u64 (x high, y
 /// low) so it fits an atomic. Coordinates can be negative for a monitor left
 /// of or above the primary one.
@@ -196,30 +207,65 @@ pub(crate) mod tests {
     /// Same as engine::zone_rects; duplicated here only so this module's tests
     /// run without the Windows-only engine. `zone_rects_matches_engine` in
     /// engine.rs keeps the two in lockstep.
-    pub(crate) fn zones(w: u32, h: u32, sizes: &[u32; 5]) -> [(u32, u32, u32); 5] {
+    pub(crate) fn zones(
+        w: u32,
+        h: u32,
+        sizes: &[u32; 5],
+        pos: &[(u32, u32); 5],
+    ) -> [(u32, u32, u32); 5] {
         const PATCH: u32 = 16;
         let dim = w.min(h).max(PATCH);
         let px = sizes.map(|pct| (dim * pct.clamp(2, 100) / 100).clamp(PATCH, dim));
         let inset_x = w / 20;
         let inset_y = h / 20;
-        [
+        let auto = [
             ((w - px[0]) / 2, (h - px[0]) / 2, px[0]),
             (inset_x.min(w - px[1]), inset_y.min(h - px[1]), px[1]),
             (w.saturating_sub(inset_x + px[2]), inset_y.min(h - px[2]), px[2]),
             (inset_x.min(w - px[3]), h.saturating_sub(inset_y + px[3]), px[3]),
             (w.saturating_sub(inset_x + px[4]), h.saturating_sub(inset_y + px[4]), px[4]),
-        ]
+        ];
+        std::array::from_fn(|i| {
+            let (ax, ay) = pos[i];
+            if ax > crate::POS_MAX || ay > crate::POS_MAX {
+                return auto[i];
+            }
+            let s = px[i];
+            let cx = (w as u64 * ax as u64 / crate::POS_MAX as u64) as u32;
+            let cy = (h as u64 * ay as u64 / crate::POS_MAX as u64) as u32;
+            (cx.saturating_sub(s / 2).min(w - s), cy.saturating_sub(s / 2).min(h - s), s)
+        })
     }
 
     const SCREENS: [(u32, u32); 6] =
         [(1920, 1080), (2560, 1440), (3840, 2160), (1080, 1920), (800, 800), (100, 60)];
     const LABEL: [(i32, i32); 5] = [(120, 18); 5];
+    const AUTO: [(u32, u32); 5] = [(crate::POS_AUTO, crate::POS_AUTO); 5];
+
+    #[test]
+    fn dragged_position_roundtrips_to_the_same_centre() {
+        for &(w, h) in &SCREENS {
+            let sizes = [8u32; 5];
+            for &(cx, cy) in &[(0i32, 0i32), (w as i32 / 2, h as i32 / 3), (w as i32, h as i32)] {
+                let mut pos = [(crate::POS_AUTO, crate::POS_AUTO); 5];
+                pos[1] = pos_from_center(cx, cy, w, h);
+                let (x, y, s) = zones(w, h, &sizes, &pos)[1];
+                // Within one permille step (plus the on-screen clamp).
+                let (mx, my) = ((x + s / 2) as i32, (y + s / 2) as i32);
+                let tol_x = (w as i32 / 1000 + 1).max(s as i32 / 2 + 1);
+                let tol_y = (h as i32 / 1000 + 1).max(s as i32 / 2 + 1);
+                assert!((mx - cx).abs() <= tol_x && (my - cy).abs() <= tol_y, "{w}x{h} ({cx},{cy}) -> ({mx},{my})");
+            }
+        }
+        // Off-screen drags clamp instead of wrapping.
+        assert_eq!(pos_from_center(-50, 99999, 1920, 1080), (0, 1000));
+    }
 
     #[test]
     fn borders_never_touch_their_own_zone() {
         for &(w, h) in &SCREENS {
             for pct in [2u32, 8, 20, 50, 100] {
-                let zs = zones(w, h, &[pct; 5]);
+                let zs = zones(w, h, &[pct; 5], &AUTO);
                 let l = layout(w, h, &zs, 3, &LABEL);
                 for (i, bar) in &l.bars {
                     let z = zone_rect(zs[*i]);
@@ -234,7 +280,7 @@ pub(crate) mod tests {
         // With the default sizes nothing the overlay draws — borders or
         // labels — may land in any measured zone, or it would skew sampling.
         for &(w, h) in &SCREENS[..5] {
-            let zs = zones(w, h, &[8; 5]);
+            let zs = zones(w, h, &[8; 5], &AUTO);
             let l = layout(w, h, &zs, 3, &LABEL);
             for (_, item) in l.bars.iter().chain(&l.labels) {
                 for (j, z) in zs.iter().enumerate() {
@@ -248,7 +294,7 @@ pub(crate) mod tests {
     fn everything_stays_on_screen() {
         for &(w, h) in &SCREENS {
             for pct in [2u32, 8, 50, 100] {
-                let zs = zones(w, h, &[pct; 5]);
+                let zs = zones(w, h, &[pct; 5], &AUTO);
                 let l = layout(w, h, &zs, 4, &[(300, 30); 5]);
                 let screen = Rect::new(0, 0, w as i32, h as i32);
                 for (_, r) in l.bars.iter().chain(&l.labels) {
@@ -261,7 +307,7 @@ pub(crate) mod tests {
 
     #[test]
     fn every_zone_gets_a_border_and_a_label() {
-        let zs = zones(1920, 1080, &[8; 5]);
+        let zs = zones(1920, 1080, &[8; 5], &AUTO);
         let l = layout(1920, 1080, &zs, 2, &LABEL);
         for i in 0..5 {
             assert_eq!(l.bars.iter().filter(|(z, _)| *z == i).count(), 4, "zone {i} bars");
@@ -273,7 +319,7 @@ pub(crate) mod tests {
     fn label_goes_above_or_falls_back_below() {
         let s = 2;
         // Center zone has plenty of room above.
-        let zs = zones(1920, 1080, &[8; 5]);
+        let zs = zones(1920, 1080, &[8; 5], &AUTO);
         let l = layout(1920, 1080, &zs, s, &LABEL);
         let center = zone_rect(zs[0]);
         let lab = l.labels.iter().find(|(i, _)| *i == 0).unwrap().1;
@@ -315,7 +361,7 @@ pub(crate) mod tests {
 
     #[test]
     fn bounds_cover_everything_but_not_the_whole_screen() {
-        let zs = zones(1920, 1080, &[8; 5]);
+        let zs = zones(1920, 1080, &[8; 5], &AUTO);
         let l = layout(1920, 1080, &zs, 3, &LABEL);
         let b = l.bounds.expect("non-empty layout");
         for (_, r) in l.bars.iter().chain(&l.labels) {

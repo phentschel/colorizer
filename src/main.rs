@@ -33,6 +33,9 @@ pub struct Config {
     pub zone_weights: [u32; 5],
     /// Side length of each zone as % of the smaller screen dimension, 2-20.
     pub zone_sizes: [u32; 5],
+    /// Custom zone centre as permille (0-1000) of the screen width/height.
+    /// Either component above POS_MAX (use POS_AUTO) = the default anchor.
+    pub zone_pos: [(u32, u32); 5],
     /// Toggle-hotkey modifiers as raw MOD_* bits (Alt=1, Ctrl=2, Shift=4,
     /// Win=8), without MOD_NOREPEAT. 0 = no hotkey.
     pub hotkey_mods: u32,
@@ -48,6 +51,10 @@ pub const MOD_SHIFT: u32 = 0x0004;
 pub const MOD_WIN: u32 = 0x0008;
 
 pub const ZONE_NAMES: [&str; 5] = ["Center", "Top-left", "Top-right", "Bottom-left", "Bottom-right"];
+/// Full scale of a custom zone position (permille of the screen).
+pub const POS_MAX: u32 = 1000;
+/// "No custom position": the zone stays at its default anchor.
+pub const POS_AUTO: u32 = u32::MAX;
 
 impl Default for Config {
     fn default() -> Self {
@@ -62,6 +69,7 @@ impl Default for Config {
             sample_ms: 500,
             zone_weights: [2, 1, 1, 1, 1],
             zone_sizes: [8; 5],
+            zone_pos: [(POS_AUTO, POS_AUTO); 5],
             hotkey_mods: MOD_CTRL | MOD_ALT,
             hotkey_vk: 0x42, // 'B'
         }
@@ -122,6 +130,8 @@ pub struct Shared {
     /// Zone overlay on the measured display. Runtime-only, deliberately not
     /// saved: a debug view shouldn't come back on its own after a restart.
     pub show_overlay: AtomicBool,
+    /// Zone overlay accepts mouse drags to reposition zones. Runtime-only.
+    pub edit_zones: AtomicBool,
     /// Delayed calibration capture: (is_dark_point, fire_at). Set by the UI,
     /// executed by the engine so it works while the window is minimized.
     pub pending: Mutex<Option<(bool, std::time::Instant)>>,
@@ -204,11 +214,16 @@ fn config_path() -> Option<PathBuf> {
 pub fn save_config(cfg: &Config) {
     let Some(path) = config_path() else { return };
     let list = |a: &[u32; 5]| a.map(|v| v.to_string()).join(",");
+    // "x:y" permille per zone, "auto" for an unmoved one.
+    let pos = cfg
+        .zone_pos
+        .map(|(x, y)| if x > POS_MAX || y > POS_MAX { "auto".to_string() } else { format!("{x}:{y}") })
+        .join(",");
     let s = format!(
-        "enabled={}\ndark_point={}\nbright_point={}\ndark_gamma={}\nbright_gamma={}\ntransition_ms={}\ntransition_down_ms={}\nsample_ms={}\nzone_weights={}\nzone_sizes={}\nhotkey_mods={}\nhotkey_vk={}\n",
+        "enabled={}\ndark_point={}\nbright_point={}\ndark_gamma={}\nbright_gamma={}\ntransition_ms={}\ntransition_down_ms={}\nsample_ms={}\nzone_weights={}\nzone_sizes={}\nzone_pos={}\nhotkey_mods={}\nhotkey_vk={}\n",
         cfg.enabled, cfg.dark_point, cfg.bright_point, cfg.dark_gamma, cfg.bright_gamma,
         cfg.transition_ms, cfg.transition_down_ms, cfg.sample_ms, list(&cfg.zone_weights), list(&cfg.zone_sizes),
-        cfg.hotkey_mods, cfg.hotkey_vk
+        pos, cfg.hotkey_mods, cfg.hotkey_vk
     );
     let _ = std::fs::write(path, s);
 }
@@ -232,6 +247,7 @@ fn load_config() -> Config {
             "sample_ms" => cfg.sample_ms = v.trim().parse().unwrap_or(cfg.sample_ms),
             "zone_weights" => parse_list(v, &mut cfg.zone_weights),
             "zone_sizes" => parse_list(v, &mut cfg.zone_sizes),
+            "zone_pos" => parse_pos(v, &mut cfg.zone_pos),
             "hotkey_mods" => cfg.hotkey_mods = v.trim().parse().unwrap_or(cfg.hotkey_mods),
             "hotkey_vk" => cfg.hotkey_vk = v.trim().parse().unwrap_or(cfg.hotkey_vk),
             _ => {}
@@ -245,6 +261,20 @@ fn parse_list(v: &str, out: &mut [u32; 5]) {
     for (slot, part) in out.iter_mut().zip(v.trim().split(',')) {
         if let Ok(n) = part.trim().parse() {
             *slot = n;
+        }
+    }
+}
+
+/// Parses "x:y,auto,x:y,..."; anything unparsable leaves that zone as it was.
+fn parse_pos(v: &str, out: &mut [(u32, u32); 5]) {
+    for (slot, part) in out.iter_mut().zip(v.trim().split(',')) {
+        let part = part.trim();
+        if part == "auto" {
+            *slot = (POS_AUTO, POS_AUTO);
+        } else if let Some((x, y)) = part.split_once(':') {
+            if let (Ok(x), Ok(y)) = (x.trim().parse(), y.trim().parse()) {
+                *slot = (x, y);
+            }
         }
     }
 }
@@ -266,6 +296,11 @@ fn sanitize(cfg: &mut Config) {
     }
     for s in &mut cfg.zone_sizes {
         *s = (*s).clamp(2, 100);
+    }
+    for p in &mut cfg.zone_pos {
+        if p.0 > POS_MAX || p.1 > POS_MAX {
+            *p = (POS_AUTO, POS_AUTO); // half-set or garbage -> default anchor
+        }
     }
     // Only the four real modifiers; a bare key with no modifier would swallow
     // that key globally, so drop the whole binding if no modifier survives.
@@ -292,6 +327,7 @@ mod tests {
             sample_ms: 1,
             zone_weights: [99; 5],
             zone_sizes: [0; 5],
+            zone_pos: [(5000, 3), (0, 1000), (POS_AUTO, 7), (1, 1), (POS_AUTO, POS_AUTO)],
             hotkey_mods: MOD_CTRL | MOD_ALT,
             hotkey_vk: 0x42,
         };
@@ -304,6 +340,22 @@ mod tests {
         assert_eq!(cfg.sample_ms, 100);
         assert_eq!(cfg.zone_weights, [10; 5]);
         assert_eq!(cfg.zone_sizes, [2; 5]);
+        // Out-of-range or half-set positions fall back to auto; valid ones stay.
+        assert_eq!(
+            cfg.zone_pos,
+            [(POS_AUTO, POS_AUTO), (0, 1000), (POS_AUTO, POS_AUTO), (1, 1), (POS_AUTO, POS_AUTO)]
+        );
+    }
+
+    #[test]
+    fn parse_pos_mixed_and_garbage() {
+        let mut pos = [(POS_AUTO, POS_AUTO); 5];
+        parse_pos("250:750, auto ,x:y,10:20", &mut pos);
+        assert_eq!(pos[0], (250, 750));
+        assert_eq!(pos[1], (POS_AUTO, POS_AUTO));
+        assert_eq!(pos[2], (POS_AUTO, POS_AUTO)); // unparsable: unchanged
+        assert_eq!(pos[3], (10, 20));
+        assert_eq!(pos[4], (POS_AUTO, POS_AUTO)); // missing: unchanged
     }
 
     #[test]
@@ -451,7 +503,7 @@ fn fmt_dur(d: Duration) -> String {
 impl App {
     /// Miniature of the screen showing where each zone sits, how big it is,
     /// how much influence it has (fill opacity) and its live measured value.
-    fn zone_preview(&self, ui: &mut egui::Ui, cfg: &Config) {
+    fn zone_preview(&self, ui: &mut egui::Ui, cfg: &mut Config) {
         let dims = self.shared.screen_dims.load(Ordering::Relaxed);
         let (sw, sh) = if dims == 0 {
             (1920u32, 1080u32) // no capture yet: assume 16:9 for the sketch
@@ -462,12 +514,39 @@ impl App {
         let scale = avail / sw as f32;
         let (resp, p) = ui.allocate_painter(
             egui::vec2(sw as f32 * scale, sh as f32 * scale),
-            egui::Sense::hover(),
+            egui::Sense::drag(),
         );
         let origin = resp.rect.min;
         p.rect_filled(resp.rect, 3.0, ui.visuals().extreme_bg_color);
 
-        for (i, &(x, y, z)) in engine::zone_rects(sw, sh, &cfg.zone_sizes).iter().enumerate() {
+        // Drag a zone to where it should measure. The grab offset keeps the
+        // zone from jumping so its centre is under the pointer.
+        let drag_id = resp.id.with("zone_drag");
+        let rects = engine::zone_rects(sw, sh, &cfg.zone_sizes, &cfg.zone_pos);
+        if resp.drag_started() {
+            let hit = resp.interact_pointer_pos().and_then(|pt| {
+                let (px, py) = ((pt.x - origin.x) / scale, (pt.y - origin.y) / scale);
+                // Later zones are drawn on top, so they win an overlap.
+                rects.iter().enumerate().rev().find_map(|(i, &(x, y, z))| {
+                    let inside = px >= x as f32 && px < (x + z) as f32 && py >= y as f32 && py < (y + z) as f32;
+                    inside.then(|| (i, px - (x + z / 2) as f32, py - (y + z / 2) as f32))
+                })
+            });
+            ui.memory_mut(|m| m.data.insert_temp(drag_id, hit));
+        }
+        if resp.dragged() {
+            let grab = ui.memory(|m| m.data.get_temp::<Option<(usize, f32, f32)>>(drag_id)).flatten();
+            if let (Some((i, dx, dy)), Some(pt)) = (grab, resp.interact_pointer_pos()) {
+                let cx = (pt.x - origin.x) / scale - dx;
+                let cy = (pt.y - origin.y) / scale - dy;
+                cfg.zone_pos[i] = overlay_layout::pos_from_center(cx as i32, cy as i32, sw, sh);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+        } else if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+
+        for (i, &(x, y, z)) in engine::zone_rects(sw, sh, &cfg.zone_sizes, &cfg.zone_pos).iter().enumerate() {
             let rect = egui::Rect::from_min_size(
                 origin + egui::vec2(x as f32 * scale, y as f32 * scale),
                 egui::Vec2::splat(z as f32 * scale),
@@ -498,7 +577,7 @@ impl App {
                 egui::Color32::WHITE,
             );
         }
-        ui.label("Fill = influence, number = measured brightness of that zone.");
+        ui.label("Drag a zone to move it. Fill = influence, number = measured brightness.");
     }
 }
 
@@ -703,7 +782,7 @@ impl eframe::App for App {
                 }
             });
             ui.add_space(4.0);
-            self.zone_preview(ui, &cfg);
+            self.zone_preview(ui, &mut cfg);
             let mut show = self.shared.show_overlay.load(Ordering::Relaxed);
             if ui
                 .checkbox(&mut show, "Show zones on screen")
@@ -714,7 +793,31 @@ impl eframe::App for App {
                 .changed()
             {
                 self.shared.show_overlay.store(show, Ordering::Relaxed);
+                if !show {
+                    self.shared.edit_zones.store(false, Ordering::Relaxed);
+                }
             }
+            ui.horizontal(|ui| {
+                let mut edit = self.shared.edit_zones.load(Ordering::Relaxed);
+                if ui
+                    .add_enabled(show, egui::Checkbox::new(&mut edit, "Move zones on screen"))
+                    .on_hover_text(
+                        "Drag a zone's label (or its border) on the real screen to the \
+                         region you want measured. The screen below the zones stays \
+                         clickable; turn this off when you're done.",
+                    )
+                    .changed()
+                {
+                    self.shared.edit_zones.store(edit, Ordering::Relaxed);
+                }
+                if ui
+                    .button("Reset positions")
+                    .on_hover_text("Put every zone back at its default spot")
+                    .clicked()
+                {
+                    cfg.zone_pos = [(POS_AUTO, POS_AUTO); 5];
+                }
+            });
             ui.separator();
 
             ui.add(
@@ -931,6 +1034,7 @@ fn main() -> eframe::Result<()> {
         screen_dims: AtomicU64::new(0),
         screen_origin: AtomicU64::new(0),
         show_overlay: AtomicBool::new(false),
+        edit_zones: AtomicBool::new(false),
         zone_medians: Default::default(),
         pending: Mutex::new(None),
         pause_until: Mutex::new(None),

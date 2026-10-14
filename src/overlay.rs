@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC,
     GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
@@ -29,11 +29,14 @@ use windows::Win32::Graphics::Gdi::{
     HFONT, HGDIOBJ, NONANTIALIASED_QUALITY, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetWindowLongPtrW,
+    LoadCursorW, PeekMessageW, SetCursor, SetWindowLongPtrW, GWL_EXSTYLE, IDC_SIZEALL, WM_CAPTURECHANGED,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_SETCURSOR,
     RegisterClassW, SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowPos,
     ShowWindow, TranslateMessage, HWND_TOPMOST, LWA_COLORKEY, MSG, PM_REMOVE, SWP_NOACTIVATE,
     SWP_SHOWWINDOW, SW_HIDE, WDA_EXCLUDEFROMCAPTURE, WM_ERASEBKGND, WM_PAINT, WNDCLASSW,
@@ -53,6 +56,7 @@ struct Snapshot {
     origin: (i32, i32),
     dims: (u32, u32),
     sizes: [u32; 5],
+    pos: [(u32, u32); 5],
     weights: [u32; 5],
     medians: Option<[u32; 5]>,
 }
@@ -73,9 +77,24 @@ impl Drop for Scene {
     }
 }
 
+/// A zone being dragged: which one, and where the cursor grabbed it relative
+/// to the zone's centre (output-local pixels), so it doesn't jump.
+#[derive(Clone, Copy)]
+struct Drag {
+    zone: usize,
+    dx: i32,
+    dy: i32,
+}
+
 thread_local! {
     static SCENE: RefCell<Option<Scene>> = const { RefCell::new(None) };
+    /// The wndproc has no user data; it reaches shared state through this.
+    static SHARED: RefCell<Option<Arc<Shared>>> = const { RefCell::new(None) };
+    static DRAG: std::cell::Cell<Option<Drag>> = const { std::cell::Cell::new(None) };
 }
+
+/// Slack around a thin border bar that still counts as grabbing it.
+const GRAB_SLOP: i32 = 5;
 
 fn rgb((r, g, b): (u8, u8, u8)) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
@@ -98,8 +117,11 @@ pub fn spawn(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
                 let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             }
             if let Some(hwnd) = create_window() {
+                SHARED.with(|s| *s.borrow_mut() = Some(shared.clone()));
                 run(&shared, hwnd);
                 SCENE.with(|s| s.borrow_mut().take());
+                SHARED.with(|s| s.borrow_mut().take());
+                DRAG.with(|d| d.set(None));
                 unsafe {
                     let _ = DestroyWindow(hwnd);
                 }
@@ -146,7 +168,14 @@ fn create_window() -> Option<HWND> {
 
 fn run(shared: &Shared, hwnd: HWND) {
     let mut shown: Option<Snapshot> = None;
+    let mut editing = false;
     while shared.running.load(Relaxed) && shared.show_overlay.load(Relaxed) {
+        // Click-through normally; grabbable while the user is placing zones.
+        let want_edit = shared.edit_zones.load(Relaxed);
+        if want_edit != editing {
+            set_click_through(hwnd, !want_edit);
+            editing = want_edit;
+        }
         let mut msg = MSG::default();
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
             unsafe {
@@ -165,7 +194,89 @@ fn run(shared: &Shared, hwnd: HWND) {
             }
             shown = snap;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        // Poll quickly while dragging so the zone keeps up with the cursor.
+        std::thread::sleep(Duration::from_millis(if editing { 16 } else { 100 }));
+    }
+    if editing {
+        set_click_through(hwnd, true);
+    }
+}
+
+fn set_click_through(hwnd: HWND, on: bool) {
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let flag = WS_EX_TRANSPARENT.0 as isize;
+        let ex = if on { ex | flag } else { ex & !flag };
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+        if on {
+            DRAG.with(|d| d.set(None));
+            let _ = ReleaseCapture();
+        }
+    }
+}
+
+/// Which zone a client-area point grabs: label first, then its border.
+fn hit_zone(x: i32, y: i32) -> Option<usize> {
+    SCENE.with(|sc| {
+        let sc = sc.borrow();
+        let scene = sc.as_ref()?;
+        let inside = |r: &Rect, slop: i32| {
+            x >= r.x - slop && x < r.right() + slop && y >= r.y - slop && y < r.bottom() + slop
+        };
+        scene
+            .layout
+            .labels
+            .iter()
+            .find(|(_, r)| inside(r, 0))
+            .or_else(|| scene.layout.bars.iter().find(|(_, r)| inside(r, GRAB_SLOP)))
+            .map(|(i, _)| *i)
+    })
+}
+
+/// Cursor in output-local pixels, plus that output's size and desktop origin.
+fn cursor_local(shared: &Shared) -> Option<((i32, i32), (u32, u32))> {
+    let dims = shared.screen_dims.load(Relaxed);
+    if dims == 0 {
+        return None;
+    }
+    let mut p = POINT::default();
+    unsafe { GetCursorPos(&mut p).ok()? };
+    let (ox, oy) = overlay_layout::unpack_origin(shared.screen_origin.load(Relaxed));
+    Some(((p.x - ox, p.y - oy), ((dims >> 32) as u32, dims as u32)))
+}
+
+fn begin_drag(hwnd: HWND, x: i32, y: i32) {
+    let Some(zone) = hit_zone(x, y) else { return };
+    let Some(shared) = SHARED.with(|s| s.borrow().clone()) else { return };
+    let Some(((cx, cy), (w, h))) = cursor_local(&shared) else { return };
+    let cfg = *shared.cfg.lock().unwrap();
+    let (zx, zy, zs) = crate::engine::zone_rects(w, h, &cfg.zone_sizes, &cfg.zone_pos)[zone];
+    let centre = (zx as i32 + zs as i32 / 2, zy as i32 + zs as i32 / 2);
+    DRAG.with(|d| d.set(Some(Drag { zone, dx: cx - centre.0, dy: cy - centre.1 })));
+    unsafe {
+        SetCapture(hwnd);
+    }
+}
+
+fn drag_to_cursor(d: Drag) {
+    let Some(shared) = SHARED.with(|s| s.borrow().clone()) else { return };
+    let Some(((cx, cy), (w, h))) = cursor_local(&shared) else { return };
+    let pos = overlay_layout::pos_from_center(cx - d.dx, cy - d.dy, w, h);
+    shared.cfg.lock().unwrap().zone_pos[d.zone] = pos;
+}
+
+fn end_drag() {
+    if DRAG.with(|d| d.take()).is_none() {
+        return;
+    }
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+    // The settings window may be hidden in the tray (its update() isn't
+    // running), so persist here instead of relying on it.
+    if let Some(shared) = SHARED.with(|s| s.borrow().clone()) {
+        let cfg = *shared.cfg.lock().unwrap();
+        crate::save_config(&cfg);
     }
 }
 
@@ -182,6 +293,7 @@ fn snapshot(shared: &Shared) -> Option<Snapshot> {
         origin: overlay_layout::unpack_origin(shared.screen_origin.load(Relaxed)),
         dims: ((dims >> 32) as u32, dims as u32),
         sizes: cfg.zone_sizes,
+        pos: cfg.zone_pos,
         weights: cfg.zone_weights,
         medians,
     })
@@ -228,7 +340,7 @@ fn apply(hwnd: HWND, s: &Snapshot) {
         SelectObject(hdc, old);
         ReleaseDC(Some(hwnd), hdc);
 
-        let zones = crate::engine::zone_rects(s.dims.0, s.dims.1, &s.sizes);
+        let zones = crate::engine::zone_rects(s.dims.0, s.dims.1, &s.sizes, &s.pos);
         let mut layout = overlay_layout::layout(s.dims.0, s.dims.1, &zones, stroke, &sizes);
         let Some(bounds) = layout.bounds else {
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -258,6 +370,27 @@ fn apply(hwnd: HWND, s: &Snapshot) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_ERASEBKGND => LRESULT(1), // WM_PAINT covers every pixel
+        WM_LBUTTONDOWN => {
+            let (x, y) = ((lp.0 & 0xFFFF) as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as i16 as i32);
+            begin_drag(hwnd, x, y);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if let Some(d) = DRAG.with(|d| d.get()) {
+                drag_to_cursor(d);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP | WM_CAPTURECHANGED => {
+            end_drag();
+            LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            // Only reachable while grabbable (click-through windows get no
+            // mouse messages), so a "move" cursor is always right.
+            SetCursor(LoadCursorW(None, IDC_SIZEALL).ok());
+            LRESULT(1)
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);

@@ -20,7 +20,8 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_FLAG_DO_NOT_WAIT,
+    D3D11_MAP_READ,
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -28,7 +29,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
-    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_ERROR_WAS_STILL_DRAWING,
+    DXGI_OUTDUPL_DESC,
     DXGI_OUTDUPL_FRAME_INFO,
 };
 use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC, HDC};
@@ -67,7 +69,7 @@ pub fn restore_ramp() {
 /// `--probe`: one capture + sample, printed to the console. Never touches gamma.
 pub fn probe() {
     let cfg = Config::default();
-    match Capture::new(cfg.zone_sizes) {
+    match Capture::new((cfg.zone_sizes, cfg.zone_pos)) {
         Ok(mut cap) => {
             for attempt in 1..=20 {
                 std::thread::sleep(Duration::from_millis(100));
@@ -200,13 +202,13 @@ fn run(shared: &Shared) {
 
             // Zone sizes changed in the UI: just recompute the rectangles.
             if let Some(c) = cap.as_mut() {
-                if c.built_sizes != cfg.zone_sizes {
-                    c.rects = zone_rects(c.width, c.height, &cfg.zone_sizes);
-                    c.built_sizes = cfg.zone_sizes;
+                if c.built != (cfg.zone_sizes, cfg.zone_pos) {
+                    c.rects = zone_rects(c.width, c.height, &cfg.zone_sizes, &cfg.zone_pos);
+                    c.built = (cfg.zone_sizes, cfg.zone_pos);
                 }
             }
             if cap.is_none() && now >= next_reinit {
-                match Capture::new(cfg.zone_sizes) {
+                match Capture::new((cfg.zone_sizes, cfg.zone_pos)) {
                     Ok(c) => {
                         shared.screen_dims.store(
                             ((c.width as u64) << 32) | c.height as u64,
@@ -232,7 +234,13 @@ fn run(shared: &Shared) {
             }
 
             if let Some(c) = cap.as_mut() {
-                match c.sample() {
+                let res = c.sample();
+                // Copy queued but not read back: check again shortly instead of
+                // waiting a whole sample interval (and never block on the GPU).
+                if c.copy_pending {
+                    next_sample = now + Duration::from_millis(20);
+                }
+                match res {
                     Ok(Some(medians)) => {
                         for (slot, m) in shared.zone_medians.iter().zip(&medians) {
                             slot.store(*m as u32, Relaxed);
@@ -534,17 +542,19 @@ struct Capture {
     staging: ID3D11Texture2D,
     /// Per-zone (x, y, side) rectangles in desktop pixels.
     rects: [(u32, u32, u32); 5],
-    /// The zone_sizes config `rects` was computed for.
-    built_sizes: [u32; 5],
+    /// The (zone_sizes, zone_pos) config `rects` was computed for.
+    built: ([u32; 5], [(u32, u32); 5]),
     width: u32,
     height: u32,
     /// Desktop position of the duplicated output (where the overlay goes).
     origin: (i32, i32),
     rgba: bool,
+    /// Patch copies are queued on the GPU and not read back yet.
+    copy_pending: bool,
 }
 
 impl Capture {
-    fn new(sizes: [u32; 5]) -> windows::core::Result<Self> {
+    fn new(layout: ([u32; 5], [(u32, u32); 5])) -> windows::core::Result<Self> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
             let (adapter, output) = find_primary_output(&factory)?;
@@ -602,20 +612,45 @@ impl Capture {
                 ctx,
                 dupl,
                 staging: staging.unwrap(),
-                rects: zone_rects(w, h, &sizes),
-                built_sizes: sizes,
+                rects: zone_rects(w, h, &layout.0, &layout.1),
+                built: layout,
                 width: w,
                 height: h,
                 origin: (coords.left, coords.top),
                 rgba,
+                copy_pending: false,
             })
         }
     }
 
-    /// Ok(None) = no new frame since last call (static screen).
+    /// Ok(None) = nothing to report yet: no new frame (static screen), or the
+    /// GPU copy is still in flight.
     /// Ok(Some(medians)) = per-zone median brightness (center, TL, TR, BL, BR).
+    ///
+    /// Two-phase so the CPU never waits on the GPU: one call queues the patch
+    /// copies, a later call (see `copy_pending`) collects them. Blocking in
+    /// Map while a game saturates the GPU used to stall and burn CPU for the
+    /// whole queue; now each call returns immediately.
     fn sample(&mut self) -> windows::core::Result<Option<[u8; 5]>> {
         unsafe {
+            if self.copy_pending {
+                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+                match self.ctx.Map(
+                    &self.staging,
+                    0,
+                    D3D11_MAP_READ,
+                    D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                    Some(&mut mapped),
+                ) {
+                    Err(e) if e.code() == DXGI_ERROR_WAS_STILL_DRAWING => return Ok(None),
+                    r => r?,
+                }
+                self.copy_pending = false;
+                let medians = self.read_medians(&mapped);
+                self.ctx.Unmap(&self.staging, 0);
+                return Ok(Some(medians));
+            }
+
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut res: Option<IDXGIResource> = None;
             match self.dupl.AcquireNextFrame(0, &mut info, &mut res) {
@@ -666,65 +701,85 @@ impl Capture {
             }
             drop(tex);
             let _ = self.dupl.ReleaseFrame();
+            // Submit now; the result is collected on a later call.
+            self.ctx.Flush();
+            self.copy_pending = true;
+            Ok(None)
+        }
+    }
 
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.ctx.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-            let base = mapped.pData as *const u8;
-            let pitch = mapped.RowPitch as usize;
+    /// Median luma per zone from the mapped staging atlas.
+    unsafe fn read_medians(&self, mapped: &D3D11_MAPPED_SUBRESOURCE) -> [u8; 5] {
+        let base = mapped.pData as *const u8;
+        let pitch = mapped.RowPitch as usize;
 
-            let mut medians = [0u8; 5];
-            let mut hist = [0u32; 256];
-            for (zone, median) in medians.iter_mut().enumerate() {
-                hist.fill(0);
-                let mut count = 0u32;
-                let x0 = zone * CELL as usize * 4;
-                for y in (0..CELL as usize).step_by(2) {
-                    let row = base.add(y * pitch + x0);
-                    for x in (0..CELL as usize).step_by(2) {
-                        let p = row.add(x * 4);
-                        let (r, g, b) = if self.rgba {
-                            (*p, *p.add(1), *p.add(2))
-                        } else {
-                            (*p.add(2), *p.add(1), *p)
-                        };
-                        // Rec. 709 luma, integer approximation.
-                        let l = (54 * r as u32 + 183 * g as u32 + 19 * b as u32) >> 8;
-                        hist[l as usize] += 1;
-                        count += 1;
-                    }
-                }
-                let mut acc = 0u32;
-                for (v, n) in hist.iter().enumerate() {
-                    acc += n;
-                    if acc * 2 >= count {
-                        *median = v as u8;
-                        break;
-                    }
+        let mut medians = [0u8; 5];
+        let mut hist = [0u32; 256];
+        for (zone, median) in medians.iter_mut().enumerate() {
+            hist.fill(0);
+            let mut count = 0u32;
+            let x0 = zone * CELL as usize * 4;
+            for y in (0..CELL as usize).step_by(2) {
+                let row = base.add(y * pitch + x0);
+                for x in (0..CELL as usize).step_by(2) {
+                    let p = row.add(x * 4);
+                    let (r, g, b) = if self.rgba {
+                        (*p, *p.add(1), *p.add(2))
+                    } else {
+                        (*p.add(2), *p.add(1), *p)
+                    };
+                    // Rec. 709 luma, integer approximation.
+                    let l = (54 * r as u32 + 183 * g as u32 + 19 * b as u32) >> 8;
+                    hist[l as usize] += 1;
+                    count += 1;
                 }
             }
-            self.ctx.Unmap(&self.staging, 0);
-
-            Ok(Some(medians))
+            let mut acc = 0u32;
+            for (v, n) in hist.iter().enumerate() {
+                acc += n;
+                if acc * 2 >= count {
+                    *median = v as u8;
+                    break;
+                }
+            }
         }
+        medians
     }
 }
 
 /// Square zone rectangles (x, y, side) in desktop pixels, from per-zone size
-/// percentages of the smaller screen dimension (2-100%). Corners are inset 5%
-/// when there is room and clamped on-screen when there isn't. Also used by
-/// the UI to draw the zone preview.
-pub fn zone_rects(w: u32, h: u32, sizes: &[u32; 5]) -> [(u32, u32, u32); 5] {
+/// percentages of the smaller screen dimension (2-100%). A zone without a
+/// custom position sits at its default anchor (center, or a corner inset 5%);
+/// one with a position is centred on that point (permille of the screen).
+/// Either way it is clamped fully on-screen. Also used by the UI preview and
+/// the overlay.
+pub fn zone_rects(
+    w: u32,
+    h: u32,
+    sizes: &[u32; 5],
+    pos: &[(u32, u32); 5],
+) -> [(u32, u32, u32); 5] {
     let dim = w.min(h).max(PATCH);
     let px = sizes.map(|pct| (dim * pct.clamp(2, 100) / 100).clamp(PATCH, dim));
     let inset_x = w / 20;
     let inset_y = h / 20;
-    [
+    let auto = [
         ((w - px[0]) / 2, (h - px[0]) / 2, px[0]),                                   // center
         (inset_x.min(w - px[1]), inset_y.min(h - px[1]), px[1]),                     // top-left
         (w.saturating_sub(inset_x + px[2]), inset_y.min(h - px[2]), px[2]),          // top-right
         (inset_x.min(w - px[3]), h.saturating_sub(inset_y + px[3]), px[3]),          // bottom-left
         (w.saturating_sub(inset_x + px[4]), h.saturating_sub(inset_y + px[4]), px[4]), // bottom-right
-    ]
+    ];
+    std::array::from_fn(|i| {
+        let (ax, ay) = pos[i];
+        if ax > crate::POS_MAX || ay > crate::POS_MAX {
+            return auto[i];
+        }
+        let s = px[i];
+        let cx = (w as u64 * ax as u64 / crate::POS_MAX as u64) as u32;
+        let cy = (h as u64 * ay as u64 / crate::POS_MAX as u64) as u32;
+        (cx.saturating_sub(s / 2).min(w - s), cy.saturating_sub(s / 2).min(h - s), s)
+    })
 }
 
 #[cfg(test)]
@@ -777,7 +832,7 @@ mod tests {
         // Landscape, portrait, square, tiny, huge — and size extremes.
         for &(w, h) in &[(1920, 1080), (1080, 1920), (800, 800), (100, 60), (7680, 2160)] {
             for &pct in &[2u32, 8, 50, 100] {
-                for (i, &(x, y, z)) in zone_rects(w, h, &[pct; 5]).iter().enumerate() {
+                for (i, &(x, y, z)) in zone_rects(w, h, &[pct; 5], &[(crate::POS_AUTO, crate::POS_AUTO); 5]).iter().enumerate() {
                     assert!(z >= 1, "zone {i} empty at {w}x{h} pct {pct}");
                     assert!(
                         x + z <= w && y + z <= h,
@@ -789,15 +844,30 @@ mod tests {
     }
 
     #[test]
+    fn custom_position_centres_zone_and_clamps_on_screen() {
+        let a = crate::POS_AUTO;
+        let mut pos = [(a, a); 5];
+        pos[1] = (500, 500); // top-left zone dragged to the middle
+        pos[2] = (1000, 0); // pushed into the top-right corner
+        let r = zone_rects(1000, 1000, &[10; 5], &pos);
+        assert_eq!(r[1], (450, 450, 100)); // centred
+        assert_eq!(r[2], (900, 0, 100)); // clamped fully on-screen
+        // Untouched zones keep their default anchors.
+        assert_eq!(r[0], zone_rects(1000, 1000, &[10; 5], &[(a, a); 5])[0]);
+    }
+
+    #[test]
     fn zone_rects_matches_overlay_test_copy() {
         // overlay_layout's tests carry a copy of zone_rects so they run
         // without the Windows engine; keep the copy honest.
         for &(w, h) in &[(1920, 1080), (1080, 1920), (800, 800), (100, 60), (7680, 2160)] {
             for sizes in [[2u32; 5], [8; 5], [100; 5], [3, 17, 50, 9, 100]] {
+                let a = crate::POS_AUTO;
+                let pos = [(a, a), (0, 0), (1000, 1000), (500, 250), (a, 700)];
                 assert_eq!(
-                    zone_rects(w, h, &sizes),
-                    crate::overlay_layout::tests::zones(w, h, &sizes),
-                    "{w}x{h} {sizes:?}"
+                    zone_rects(w, h, &sizes, &pos),
+                    crate::overlay_layout::tests::zones(w, h, &sizes, &pos),
+                    "{w}x{h} {sizes:?} {pos:?}"
                 );
             }
         }
