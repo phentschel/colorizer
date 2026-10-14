@@ -212,6 +212,10 @@ fn run(shared: &Shared) {
                             ((c.width as u64) << 32) | c.height as u64,
                             Relaxed,
                         );
+                        shared.screen_origin.store(
+                            crate::overlay_layout::pack_origin(c.origin.0, c.origin.1),
+                            Relaxed,
+                        );
                         cap = Some(c);
                         shared.capture_ok.store(true, Relaxed);
                         reinit_backoff = Duration::from_secs(2);
@@ -534,6 +538,8 @@ struct Capture {
     built_sizes: [u32; 5],
     width: u32,
     height: u32,
+    /// Desktop position of the duplicated output (where the overlay goes).
+    origin: (i32, i32),
     rgba: bool,
 }
 
@@ -559,6 +565,7 @@ impl Capture {
             let device = device.unwrap();
             let ctx = ctx.unwrap();
 
+            let coords = output.GetDesc()?.DesktopCoordinates;
             let output1: IDXGIOutput1 = output.cast()?;
             let dupl = output1.DuplicateOutput(&device)?;
 
@@ -599,6 +606,7 @@ impl Capture {
                 built_sizes: sizes,
                 width: w,
                 height: h,
+                origin: (coords.left, coords.top),
                 rgba,
             })
         }
@@ -776,6 +784,21 @@ mod tests {
                         "zone {i} off-screen at {w}x{h} pct {pct}: ({x},{y},{z})"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn zone_rects_matches_overlay_test_copy() {
+        // overlay_layout's tests carry a copy of zone_rects so they run
+        // without the Windows engine; keep the copy honest.
+        for &(w, h) in &[(1920, 1080), (1080, 1920), (800, 800), (100, 60), (7680, 2160)] {
+            for sizes in [[2u32; 5], [8; 5], [100; 5], [3, 17, 50, 9, 100]] {
+                assert_eq!(
+                    zone_rects(w, h, &sizes),
+                    crate::overlay_layout::tests::zones(w, h, &sizes),
+                    "{w}x{h} {sizes:?}"
+                );
             }
         }
     }

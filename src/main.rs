@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod engine;
+mod overlay;
+mod overlay_layout;
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -113,8 +115,13 @@ pub struct Shared {
     pub capture_ok: AtomicBool,
     /// False while the driver rejects our gamma ramp.
     pub gamma_ok: AtomicBool,
-    /// Primary screen size, packed (width << 32) | height; 0 = unknown.
+    /// Measured screen size, packed (width << 32) | height; 0 = unknown.
     pub screen_dims: AtomicU64,
+    /// Desktop position of the measured output, see overlay_layout::pack_origin.
+    pub screen_origin: AtomicU64,
+    /// Zone overlay on the measured display. Runtime-only, deliberately not
+    /// saved: a debug view shouldn't come back on its own after a restart.
+    pub show_overlay: AtomicBool,
     /// Delayed calibration capture: (is_dark_point, fire_at). Set by the UI,
     /// executed by the engine so it works while the window is minimized.
     pub pending: Mutex<Option<(bool, std::time::Instant)>>,
@@ -363,6 +370,8 @@ mod tests {
 struct App {
     shared: Arc<Shared>,
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Zone overlay thread; only alive while the overlay is shown.
+    overlay: Option<std::thread::JoinHandle<()>>,
     restore_after_capture: bool,
     tray: Option<tray_icon::TrayIcon>,
     /// Last icon/tooltip pushed to the tray, so they are only re-set on change.
@@ -468,7 +477,11 @@ impl App {
             p.rect_stroke(
                 rect,
                 2.0,
-                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(200)),
+                {
+                    // Same colour as the on-screen overlay, so the two map 1:1.
+                    let (r, g, b) = overlay_layout::zone_color(i, cfg.zone_weights[i]);
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(r, g, b))
+                },
                 egui::StrokeKind::Inside,
             );
             let med = self.shared.zone_medians[i].load(Ordering::Relaxed);
@@ -516,6 +529,16 @@ impl eframe::App for App {
             let _ = self.worker.take().map(|h| h.join());
             self.worker = Some(engine::spawn(self.shared.clone()));
             self.last_respawn = Some(std::time::Instant::now());
+        }
+        // Overlay thread: started on demand, exits by itself when switched
+        // off. Also covers a quick off->on where the old thread was already
+        // on its way out when the box was ticked again.
+        if self.shared.show_overlay.load(Ordering::Relaxed)
+            && !self.quitting
+            && self.overlay.as_ref().is_none_or(|h| h.is_finished())
+        {
+            let _ = self.overlay.take().map(|h| h.join());
+            self.overlay = Some(overlay::spawn(self.shared.clone()));
         }
         // Closing the window hides to tray; only the tray Quit really exits.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
@@ -681,6 +704,17 @@ impl eframe::App for App {
             });
             ui.add_space(4.0);
             self.zone_preview(ui, &cfg);
+            let mut show = self.shared.show_overlay.load(Ordering::Relaxed);
+            if ui
+                .checkbox(&mut show, "Show zones on screen")
+                .on_hover_text(
+                    "Outline the zones on the measured display. Click-through, \
+                     and kept out of the measurement.",
+                )
+                .changed()
+            {
+                self.shared.show_overlay.store(show, Ordering::Relaxed);
+            }
             ui.separator();
 
             ui.add(
@@ -834,6 +868,9 @@ impl eframe::App for App {
         if let Some(h) = self.worker.take() {
             let _ = h.join(); // worker restores the original gamma ramp on exit
         }
+        if let Some(h) = self.overlay.take() {
+            let _ = h.join(); // sees `running` go false within one tick
+        }
     }
 }
 
@@ -892,6 +929,8 @@ fn main() -> eframe::Result<()> {
         capture_ok: AtomicBool::new(false),
         gamma_ok: AtomicBool::new(true),
         screen_dims: AtomicU64::new(0),
+        screen_origin: AtomicU64::new(0),
+        show_overlay: AtomicBool::new(false),
         zone_medians: Default::default(),
         pending: Mutex::new(None),
         pause_until: Mutex::new(None),
@@ -1021,6 +1060,7 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(App {
                 shared,
                 worker,
+                overlay: None,
                 restore_after_capture: false,
                 tray,
                 icon_enabled: enabled,
