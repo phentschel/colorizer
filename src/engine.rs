@@ -10,13 +10,16 @@
 //! - The device is created on the adapter that owns the primary output, which
 //!   keeps hybrid-GPU laptops on the fast path.
 
+use crate::overlay_layout::{zone_rects, PATCH};
 use crate::{Config, Shared};
 use std::sync::atomic::Ordering::Relaxed;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, HMODULE, POINT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
@@ -25,20 +28,32 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput6,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_ERROR_WAS_STILL_DRAWING,
     DXGI_OUTDUPL_DESC,
     DXGI_OUTDUPL_FRAME_INFO,
 };
-use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC, HDC};
+use windows::Win32::Graphics::Gdi::{
+    CreateDCW, DeleteDC, GetDC, GetMonitorInfoW, MonitorFromPoint, ReleaseDC, HDC, HMONITOR,
+    MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTOPRIMARY,
+};
+use windows::Win32::System::Threading::{
+    OpenMutexW, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject, INFINITE,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    SYNCHRONIZATION_SYNCHRONIZE,
+};
 use windows::Win32::UI::ColorSystem::{GetDeviceGammaRamp, SetDeviceGammaRamp};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE, WM_HOTKEY};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowThreadProcessId, MsgWaitForMultipleObjects, PeekMessageW, MSG,
+    PM_REMOVE, QS_HOTKEY, WM_HOTKEY,
+};
 
 
 pub fn spawn(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
@@ -63,6 +78,97 @@ pub fn restore_ramp() {
         println!("restore: original gamma ramp put back");
     } else {
         println!("restore: nothing was boosted, ramp left alone");
+    }
+}
+
+/// Called by the watchdog after the owning process is gone. Same repair as
+/// `--restore`, but silent and only acts when the marker says a boost was left.
+fn restore_if_orphaned() {
+    let mut g = Gamma::new();
+    g.restore();
+}
+
+/// `--watchdog <pid>`: a tiny sibling process the app spawns at startup. It
+/// sleeps until the app exits and then puts the original ramp back if the app
+/// died mid-boost (Task Manager, crash, ...). Nothing runs inside a
+/// TerminateProcess'd process, so the repair has to live outside it. A normal
+/// exit clears the marker first, which makes this a no-op.
+pub fn watchdog(parent_pid: u32) {
+    unsafe {
+        if let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) {
+            WaitForSingleObject(h, INFINITE);
+            let _ = CloseHandle(h);
+        }
+        // Give a relaunch (autostart, user) a moment to take the single-instance
+        // mutex; a live instance owns the ramp and must not be fought.
+        std::thread::sleep(Duration::from_millis(1500));
+        if !instance_running() {
+            restore_if_orphaned();
+        }
+    }
+}
+
+/// True while another AutoBright process owns the single-instance mutex.
+pub fn instance_running() -> bool {
+    unsafe {
+        match OpenMutexW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            false,
+            windows::core::w!("AutoBright_SingleInstance"),
+        ) {
+            Ok(h) => {
+                let _ = CloseHandle(h);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// `--probe-ramp`: verifies the assumption the whole feedback loop rests on —
+/// that Desktop Duplication sees the framebuffer *before* the gamma ramp. If it
+/// saw the boosted image, brightening would darken the measurement and the
+/// boost would oscillate. Applies a strong temporary boost (restored on exit)
+/// and checks that the measured value does not follow it.
+pub fn probe_ramp() {
+    let cfg = Config::default();
+    let mut cap = match Capture::new((cfg.zone_sizes, cfg.zone_pos)) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("probe-ramp: capture init failed: {e}");
+            return;
+        }
+    };
+    // A fresh sample needs a new desktop frame, so a static screen can stall.
+    let next = |cap: &mut Capture| -> Option<u8> {
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(50));
+            match cap.sample() {
+                Ok(Some(m)) => return Some(combine(&m, &cfg.zone_weights)),
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+        }
+        None
+    };
+    let Some(base) = next(&mut cap) else {
+        println!("probe-ramp: no baseline frame — move the mouse or play something, then retry");
+        return;
+    };
+    let mut gamma = Gamma::new();
+    gamma.set(2.0);
+    let after = next(&mut cap);
+    drop(gamma); // restores the original ramp
+    match after {
+        Some(v) if (v as i32 - base as i32).abs() <= 6 => {
+            println!("probe-ramp: OK — capture is pre-ramp (baseline {base}, boosted {v})")
+        }
+        Some(v) => println!(
+            "probe-ramp: WARNING — measurement followed the ramp (baseline {base}, boosted {v}); \
+             the boost loop may oscillate. (Screen content changing between frames can cause \
+             this too: retry on a quiet desktop.)"
+        ),
+        None => println!("probe-ramp: inconclusive — no frame after the ramp change (static screen)"),
     }
 }
 
@@ -94,14 +200,47 @@ pub fn probe() {
 
 /// (Re)register the global toggle hotkey on id 1. Always unregisters first so a
 /// changed binding replaces the old one; a zero binding just clears it.
-fn register_hotkey(mods: u32, vk: u32) {
+/// Returns false when Windows refused the binding (another program owns it).
+fn register_hotkey(mods: u32, vk: u32) -> bool {
     unsafe {
         let _ = UnregisterHotKey(None, 1);
         if mods != 0 && vk != 0 {
             let flags = HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT;
-            let _ = RegisterHotKey(None, 1, flags, vk);
+            return RegisterHotKey(None, 1, flags, vk).is_ok();
         }
+        true
     }
+}
+
+/// File name (lowercase) of the process owning the foreground window.
+fn foreground_exe() -> Option<String> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 520];
+        let mut len = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(h);
+        r.ok()?;
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit(['\\', '/']).next().map(|s| s.to_ascii_lowercase())
+    }
+}
+
+/// `list` is user text: exe names separated by commas, semicolons or newlines,
+/// compared case-insensitively against the foreground exe's file name.
+fn is_excluded(list: &str, exe: &str) -> bool {
+    list.split([',', ';', '\n'])
+        .map(|s| s.trim().trim_matches('"'))
+        .any(|s| !s.is_empty() && s.eq_ignore_ascii_case(exe))
 }
 
 fn run(shared: &Shared) {
@@ -121,7 +260,16 @@ fn run(shared: &Shared) {
         let c = shared.cfg.lock().unwrap();
         (c.hotkey_mods, c.hotkey_vk)
     };
-    register_hotkey(hotkey.0, hotkey.1);
+    shared.hotkey_ok.store(register_hotkey(hotkey.0, hotkey.1), Relaxed);
+
+    // Foreground-app exclusion: polled twice a second, not every tick.
+    let own_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()))
+        .unwrap_or_default();
+    let mut next_fg = Instant::now();
+    let mut suppressed = false;
+    let mut was_suppressed = false;
 
     // Transition state: eased ramp from `start` to `target` beginning at `t0`.
     let mut cur = 1.0f32;
@@ -130,6 +278,8 @@ fn run(shared: &Shared) {
     let mut t0 = Instant::now();
     let mut dur_s = 0.001f32;
     let mut last_measured = f32::MIN;
+    // A boost increase waiting out the hold: (wanted gamma, first seen).
+    let mut pending_up: Option<(f32, Instant)> = None;
 
     while shared.running.load(Relaxed) {
         let mut msg = MSG::default();
@@ -165,9 +315,25 @@ fn run(shared: &Shared) {
 
         // Hotkey changed in the UI: rebind.
         if (cfg.hotkey_mods, cfg.hotkey_vk) != hotkey {
-            register_hotkey(cfg.hotkey_mods, cfg.hotkey_vk);
+            shared
+                .hotkey_ok
+                .store(register_hotkey(cfg.hotkey_mods, cfg.hotkey_vk), Relaxed);
             hotkey = (cfg.hotkey_mods, cfg.hotkey_vk);
         }
+
+        if Instant::now() >= next_fg {
+            next_fg = Instant::now() + Duration::from_millis(500);
+            if let Some(exe) = foreground_exe() {
+                suppressed = is_excluded(&shared.exclude.lock().unwrap(), &exe);
+                if exe != own_exe {
+                    let mut last = shared.last_app.lock().unwrap();
+                    if *last != exe {
+                        *last = exe;
+                    }
+                }
+            }
+        }
+        shared.suppressed.store(suppressed && cfg.enabled, Relaxed);
 
         // UI asked to put the original ramp back right now (stuck-gamma kick).
         // If still enabled, the next tick recomputes cleanly from the original.
@@ -178,6 +344,7 @@ fn run(shared: &Shared) {
             start = 1.0;
             target = 1.0;
             last_measured = f32::MIN;
+            pending_up = None;
         }
 
         // A pending calibration capture keeps sampling alive even while off;
@@ -191,11 +358,15 @@ fn run(shared: &Shared) {
         if !active && cap.is_some() {
             cap = None;
             shared.capture_ok.store(false, Relaxed);
+            shared.hdr_active.store(false, Relaxed);
             next_reinit = Instant::now();
             reinit_backoff = Duration::from_secs(2);
         }
 
         let now = Instant::now();
+
+        // Fresh target from this tick's measurement, if any (see `gate`).
+        let mut new_want: Option<f32> = None;
 
         if active && now >= next_sample {
             next_sample = now + Duration::from_millis(cfg.sample_ms as u64);
@@ -220,13 +391,15 @@ fn run(shared: &Shared) {
                         );
                         cap = Some(c);
                         shared.capture_ok.store(true, Relaxed);
+                        shared.hdr_active.store(false, Relaxed);
                         reinit_backoff = Duration::from_secs(2);
                         // Capture coming back often means the ramp was reset
                         // too (game exit, resume from sleep) — heal now.
                         next_heal = now;
                     }
-                    Err(_) => {
+                    Err(e) => {
                         shared.capture_ok.store(false, Relaxed);
+                        shared.hdr_active.store(matches!(e, CaptureError::Hdr), Relaxed);
                         next_reinit = now + reinit_backoff;
                         reinit_backoff = (reinit_backoff * 2).min(Duration::from_secs(30));
                     }
@@ -251,20 +424,7 @@ fn run(shared: &Shared) {
                         // Deadband: ±3 counts of flicker never retargets.
                         if (mf - last_measured).abs() >= 3.0 {
                             last_measured = mf;
-                            let want = target_gamma(&cfg, mf);
-                            if (want - target).abs() > 0.005 {
-                                start = cur;
-                                target = want;
-                                t0 = now;
-                                // Less boost = the scene got brighter: ramp
-                                // down fast so it doesn't glare.
-                                let ms = if want < cur {
-                                    cfg.transition_down_ms
-                                } else {
-                                    cfg.transition_ms
-                                };
-                                dur_s = ms.max(1) as f32 / 1000.0;
-                            }
+                            new_want = Some(target_gamma(&cfg, mf));
                         }
                     }
                     Ok(None) => {} // no new frame: screen static, nothing to do
@@ -279,6 +439,24 @@ fn run(shared: &Shared) {
                     }
                 }
             }
+        }
+
+        // Boost decreases apply at once; increases must persist for hold_ms.
+        // Runs every tick so a held increase still lands on a static screen.
+        if let Some(want) = gate(
+            &mut pending_up,
+            new_want,
+            target,
+            now,
+            Duration::from_millis(cfg.hold_ms as u64),
+        ) {
+            start = cur;
+            target = want;
+            t0 = now;
+            // Less boost = the scene got brighter: ramp down fast so it
+            // doesn't glare.
+            let ms = if want < cur { cfg.transition_down_ms } else { cfg.transition_ms };
+            dur_s = ms.max(1) as f32 / 1000.0;
         }
 
         // Delayed calibration capture: fire once the countdown elapsed and a
@@ -309,16 +487,39 @@ fn run(shared: &Shared) {
         }
 
         if now >= next_heal {
+            // The primary display changed (user re-arranged monitors): the
+            // ramp we hold and the output we duplicate belong to the old one.
+            // Put the old display back, then rebuild both on the new primary.
+            if let Some((m, _)) = primary_monitor() {
+                if gamma.monitor.is_some_and(|g| g != m) {
+                    gamma.restore();
+                    gamma = Gamma::new();
+                    cap = None;
+                    shared.capture_ok.store(false, Relaxed);
+                    next_reinit = now;
+                    reinit_backoff = Duration::from_secs(2);
+                    start = cur; // hold the current boost until new samples arrive
+                    target = cur;
+                    last_measured = f32::MIN;
+                    pending_up = None;
+                }
+            }
             // Only while capture works: with capture broken (exclusive
             // fullscreen) the game owns the ramp — fighting it flickers.
             if cap.is_some() {
                 gamma.heal();
             }
-            next_heal = now + Duration::from_secs(10);
+            next_heal = now + Duration::from_secs(5);
         }
 
         let mut transitioning = false;
-        if cfg.enabled {
+        if cfg.enabled && !suppressed {
+            if was_suppressed {
+                // Excluded app lost the foreground: ease the boost back in.
+                start = 1.0;
+                t0 = now;
+                dur_s = cfg.transition_ms.max(1) as f32 / 1000.0;
+            }
             let e = (now - t0).as_secs_f32() / dur_s;
             transitioning = e < 1.0 && (target - start).abs() > 1e-4;
             cur = if transitioning {
@@ -329,25 +530,71 @@ fn run(shared: &Shared) {
             gamma.set(cur);
             shared.gamma_milli.store((cur * 1000.0).round() as u32, Relaxed);
             shared.gamma_ok.store(gamma.ok, Relaxed);
+        } else if cfg.enabled {
+            // Excluded app in the foreground: neutral ramp, but keep the
+            // target and last measurement so the boost resumes instantly.
+            gamma.restore();
+            shared.gamma_milli.store(1000, Relaxed);
+            shared.gamma_ok.store(gamma.ok, Relaxed);
+            cur = 1.0;
         } else {
             gamma.restore();
             shared.gamma_milli.store(1000, Relaxed);
-            shared.gamma_ok.store(true, Relaxed);
+            shared.gamma_ok.store(gamma.ok, Relaxed);
             cur = 1.0;
             start = 1.0;
             target = 1.0;
             last_measured = f32::MIN;
+            pending_up = None;
         }
+        was_suppressed = cfg.enabled && suppressed;
+        shared.recovery_ok.store(gamma.recovery_ok(), Relaxed);
 
-        std::thread::sleep(Duration::from_millis(if transitioning {
+        // Sleep until the next tick, but wake at once for WM_HOTKEY so the
+        // toggle hotkey doesn't wait out the idle interval.
+        let wait_ms = if transitioning {
             16
         } else if active {
             50
         } else {
             100
-        }));
+        };
+        unsafe {
+            MsgWaitForMultipleObjects(None, false, wait_ms, QS_HOTKEY);
+        }
     }
     // Gamma::drop restores the original ramp.
+}
+
+/// Gate for new gamma targets, to stop the boost "pumping" on fast cuts.
+/// A decrease (scene got brighter) applies immediately so it never glares; an
+/// increase is held until the darker reading has stayed above the current
+/// target for `hold`. A reading that falls back cancels the pending increase.
+fn gate(
+    pending: &mut Option<(f32, Instant)>,
+    new_want: Option<f32>,
+    target: f32,
+    now: Instant,
+    hold: Duration,
+) -> Option<f32> {
+    if let Some(want) = new_want {
+        if (want - target).abs() <= 0.005 {
+            *pending = None;
+        } else if want < target {
+            *pending = None;
+            return Some(want);
+        } else {
+            let since = pending.map_or(now, |(_, s)| s);
+            *pending = Some((want, since));
+        }
+    }
+    if let Some((want, since)) = *pending {
+        if want > target + 0.005 && now.duration_since(since) >= hold {
+            *pending = None;
+            return Some(want);
+        }
+    }
+    None
 }
 
 fn combine(medians: &[u8; 5], weights: &[u32; 5]) -> u8 {
@@ -385,6 +632,10 @@ const MARKER_FILE: &str = "boost_active";
 
 struct Gamma {
     hdc: HDC,
+    /// True when `hdc` came from CreateDCW (DeleteDC) rather than GetDC.
+    owned_dc: bool,
+    /// The primary monitor this ramp belongs to; None if it couldn't be told.
+    monitor: Option<HMONITOR>,
     original: [u16; 768],
     /// The exact ramp we last wrote to the hardware (original when neutral).
     last_written: [u16; 768],
@@ -393,11 +644,30 @@ struct Gamma {
     marker: bool,
     /// False when the driver rejected our last SetDeviceGammaRamp.
     ok: bool,
+    /// The saved original ramp (crash-recovery truth) is on disk.
+    ramp_saved: bool,
+    /// The last boost-marker write/removal succeeded.
+    marker_ok: bool,
 }
 
 impl Gamma {
     fn new() -> Self {
-        let hdc = unsafe { GetDC(None) };
+        // A DC on the primary display's own device, so the ramp we read, write
+        // and restore is that display's, not whatever GetDC(NULL) resolves to.
+        let monitor = primary_monitor();
+        let (hdc, owned_dc) = match &monitor {
+            Some((_, dev)) => {
+                let dc = unsafe {
+                    CreateDCW(PCWSTR(dev.as_ptr()), PCWSTR::null(), PCWSTR::null(), None)
+                };
+                if dc.is_invalid() {
+                    (unsafe { GetDC(None) }, false)
+                } else {
+                    (dc, true)
+                }
+            }
+            None => (unsafe { GetDC(None) }, false),
+        };
         let mut captured = [0u16; 768];
         unsafe {
             let _ = GetDeviceGammaRamp(hdc, captured.as_mut_ptr() as *mut _);
@@ -405,16 +675,30 @@ impl Gamma {
         let dir = crate::config_dir();
         let marker = dir.as_ref().is_some_and(|d| d.join(MARKER_FILE).exists());
         let mut original = captured;
+        let mut ramp_saved = dir.is_some();
         if marker {
-            if let Some(saved) = dir.as_ref().and_then(|d| read_ramp(&d.join(RAMP_FILE))) {
-                original = saved;
+            match dir.as_ref().and_then(|d| read_ramp(&d.join(RAMP_FILE))) {
+                Some(saved) => original = saved,
+                None => ramp_saved = false, // marker but no usable saved ramp
             }
         } else if let Some(d) = &dir {
             // Clean start: what we captured IS the user's real ramp (ICC,
             // Night Light, …) — refresh the saved copy.
-            let _ = write_ramp(&d.join(RAMP_FILE), &captured);
+            ramp_saved = write_ramp(&d.join(RAMP_FILE), &captured).is_ok();
         }
-        Self { hdc, original, last_written: original, applied: None, dir, marker, ok: true }
+        Self {
+            hdc,
+            owned_dc,
+            monitor: monitor.map(|(m, _)| m),
+            original,
+            last_written: original,
+            applied: None,
+            dir,
+            marker,
+            ok: true,
+            ramp_saved,
+            marker_ok: true,
+        }
     }
 
     fn set(&mut self, g: f32) {
@@ -442,40 +726,57 @@ impl Gamma {
 
     fn restore(&mut self) {
         if self.applied.is_some() || self.marker {
-            unsafe {
-                let _ = SetDeviceGammaRamp(self.hdc, self.original.as_ptr() as *const _);
+            let ok = unsafe { SetDeviceGammaRamp(self.hdc, self.original.as_ptr() as *const _) }
+                .as_bool();
+            self.ok = ok;
+            // A rejected restore keeps `applied`/marker set so it is retried
+            // (and so crash recovery still knows the screen is boosted).
+            if ok {
+                self.last_written = self.original;
+                self.applied = None;
+                self.set_marker(false);
             }
-            self.last_written = self.original;
-            self.applied = None;
-            self.ok = true;
-            self.set_marker(false);
         }
     }
 
     /// Periodic self-check against the actual hardware ramp.
-    /// - Boosted and someone reset the ramp (game exit, resume from sleep):
-    ///   rewrite our ramp — the boost wins while it is active.
-    /// - Neutral and the ramp changed (Night Light, ICC loader): adopt it as
-    ///   the new original so future boosts compose through it.
+    /// - Boosted and the ramp is no longer ours: another tool wrote a fresh,
+    ///   un-boosted ramp (Night Light, ICC loader, f.lux, or a plain reset).
+    ///   That ramp is the new original: adopt it and recompose the boost
+    ///   through it on the next `set`, instead of stomping it with a stale one.
+    /// - Neutral and the ramp changed: adopt it as the new original so future
+    ///   boosts compose through it.
+    /// Differences within `RAMP_TOLERANCE` are driver rounding, not change.
     fn heal(&mut self) {
         let mut hw = [0u16; 768];
         if !unsafe { GetDeviceGammaRamp(self.hdc, hw.as_mut_ptr() as *mut _) }.as_bool() {
             return;
         }
         if self.applied.is_some() {
-            if hw != self.last_written {
-                self.ok = unsafe {
-                    SetDeviceGammaRamp(self.hdc, self.last_written.as_ptr() as *const _)
-                }
-                .as_bool();
+            if ramps_differ(&hw, &self.last_written) {
+                self.original = hw;
+                self.persist_original();
+                self.applied = None; // forces the next set() to rewrite
             }
-        } else if !self.marker && hw != self.original {
+        } else if !self.marker && ramps_differ(&hw, &self.original) {
             self.original = hw;
             self.last_written = hw;
-            if let Some(d) = &self.dir {
-                let _ = write_ramp(&d.join(RAMP_FILE), &hw);
-            }
+            self.persist_original();
         }
+    }
+
+    /// Save `original` as the crash-recovery truth.
+    fn persist_original(&mut self) {
+        self.ramp_saved = match &self.dir {
+            Some(d) => write_ramp(&d.join(RAMP_FILE), &self.original).is_ok(),
+            None => false,
+        };
+    }
+
+    /// False when crash recovery can't work: the saved original ramp or the
+    /// boost marker could not be written.
+    fn recovery_ok(&self) -> bool {
+        self.ramp_saved && self.marker_ok
     }
 
     fn set_marker(&mut self, on: bool) {
@@ -487,12 +788,43 @@ impl Gamma {
             let ok = if on {
                 std::fs::write(&path, b"1").is_ok()
             } else {
-                std::fs::remove_file(&path).is_ok()
+                match std::fs::remove_file(&path) {
+                    Ok(()) => true,
+                    Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+                }
             };
+            self.marker_ok = ok;
             if ok {
                 self.marker = on;
             }
+        } else {
+            self.marker_ok = false;
         }
+    }
+}
+
+/// Largest per-entry deviation (of 65535) still counted as "the same ramp":
+/// drivers round what they are given, and a read-back must not look like an
+/// external change, or adopting our own boosted ramp would stack the boost.
+const RAMP_TOLERANCE: i32 = 1024;
+
+fn ramps_differ(a: &[u16; 768], b: &[u16; 768]) -> bool {
+    a.iter().zip(b).any(|(x, y)| (*x as i32 - *y as i32).abs() > RAMP_TOLERANCE)
+}
+
+/// The primary monitor and its GDI device name (NUL-terminated UTF-16).
+fn primary_monitor() -> Option<(HMONITOR, Vec<u16>)> {
+    unsafe {
+        let m = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        if m.is_invalid() {
+            return None;
+        }
+        let mut mi = MONITORINFOEXW::default();
+        mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if !GetMonitorInfoW(m, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO).as_bool() {
+            return None;
+        }
+        Some((m, mi.szDevice.to_vec()))
     }
 }
 
@@ -520,7 +852,11 @@ impl Drop for Gamma {
     fn drop(&mut self) {
         self.restore();
         unsafe {
-            ReleaseDC(None, self.hdc);
+            if self.owned_dc {
+                let _ = DeleteDC(self.hdc);
+            } else {
+                ReleaseDC(None, self.hdc);
+            }
         }
     }
 }
@@ -533,7 +869,29 @@ impl Drop for Gamma {
 /// therefore constant regardless of configured zone size.
 const CELL: u32 = 96;
 const GRID: u32 = 6;
-const PATCH: u32 = 16;
+
+
+/// Why a capture could not start. HDR is its own case so the UI can say so
+/// instead of guessing.
+enum CaptureError {
+    Hdr,
+    Failed(windows::core::Error),
+}
+
+impl From<windows::core::Error> for CaptureError {
+    fn from(e: windows::core::Error) -> Self {
+        Self::Failed(e)
+    }
+}
+
+impl fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hdr => f.write_str("HDR is on for the primary display (gamma ramps don't apply)"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
 
 struct Capture {
     _device: ID3D11Device,
@@ -554,10 +912,15 @@ struct Capture {
 }
 
 impl Capture {
-    fn new(layout: ([u32; 5], [(u32, u32); 5])) -> windows::core::Result<Self> {
+    fn new(layout: ([u32; 5], [(u32, u32); 5])) -> Result<Self, CaptureError> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
             let (adapter, output) = find_primary_output(&factory)?;
+            // Checked before any device work: with HDR on the display ignores
+            // the gamma ramp, so there is nothing to compensate.
+            if output_is_hdr(&output) {
+                return Err(CaptureError::Hdr);
+            }
 
             let mut device: Option<ID3D11Device> = None;
             let mut ctx: Option<ID3D11DeviceContext> = None;
@@ -584,11 +947,14 @@ impl Capture {
             let rgba = match fmt {
                 DXGI_FORMAT_B8G8R8A8_UNORM => false,
                 DXGI_FORMAT_R8G8B8A8_UNORM => true,
-                // ponytail: HDR desktops (R16G16B16A16_FLOAT) unsupported;
-                // gamma ramps don't apply in HDR anyway.
-                _ => return Err(windows::core::Error::from_hresult(
-                    windows::Win32::Foundation::E_FAIL,
-                )),
+                // Gamma ramps don't apply in HDR, so an FP16 desktop is not
+                // sampled; it is reported as HDR rather than as a failure.
+                DXGI_FORMAT_R16G16B16A16_FLOAT => return Err(CaptureError::Hdr),
+                _ => {
+                    return Err(CaptureError::Failed(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_FAIL,
+                    )))
+                }
             };
             let (w, h) = (dd.ModeDesc.Width, dd.ModeDesc.Height);
 
@@ -747,41 +1113,6 @@ impl Capture {
     }
 }
 
-/// Square zone rectangles (x, y, side) in desktop pixels, from per-zone size
-/// percentages of the smaller screen dimension (2-100%). A zone without a
-/// custom position sits at its default anchor (center, or a corner inset 5%);
-/// one with a position is centred on that point (permille of the screen).
-/// Either way it is clamped fully on-screen. Also used by the UI preview and
-/// the overlay.
-pub fn zone_rects(
-    w: u32,
-    h: u32,
-    sizes: &[u32; 5],
-    pos: &[(u32, u32); 5],
-) -> [(u32, u32, u32); 5] {
-    let dim = w.min(h).max(PATCH);
-    let px = sizes.map(|pct| (dim * pct.clamp(2, 100) / 100).clamp(PATCH, dim));
-    let inset_x = w / 20;
-    let inset_y = h / 20;
-    let auto = [
-        ((w - px[0]) / 2, (h - px[0]) / 2, px[0]),                                   // center
-        (inset_x.min(w - px[1]), inset_y.min(h - px[1]), px[1]),                     // top-left
-        (w.saturating_sub(inset_x + px[2]), inset_y.min(h - px[2]), px[2]),          // top-right
-        (inset_x.min(w - px[3]), h.saturating_sub(inset_y + px[3]), px[3]),          // bottom-left
-        (w.saturating_sub(inset_x + px[4]), h.saturating_sub(inset_y + px[4]), px[4]), // bottom-right
-    ];
-    std::array::from_fn(|i| {
-        let (ax, ay) = pos[i];
-        if ax > crate::POS_MAX || ay > crate::POS_MAX {
-            return auto[i];
-        }
-        let s = px[i];
-        let cx = (w as u64 * ax as u64 / crate::POS_MAX as u64) as u32;
-        let cy = (h as u64 * ay as u64 / crate::POS_MAX as u64) as u32;
-        (cx.saturating_sub(s / 2).min(w - s), cy.saturating_sub(s / 2).min(h - s), s)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,6 +1148,35 @@ mod tests {
     }
 
     #[test]
+    fn gate_applies_decreases_now_and_holds_increases() {
+        let t0 = Instant::now();
+        let hold = Duration::from_millis(500);
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut p = None;
+        // Brighter scene: less boost, immediate.
+        assert_eq!(gate(&mut p, Some(1.0), 1.5, at(0), hold), Some(1.0));
+        // Darker scene: held...
+        assert_eq!(gate(&mut p, Some(1.5), 1.0, at(100), hold), None);
+        assert_eq!(gate(&mut p, None, 1.0, at(400), hold), None);
+        // ...and lands once it persisted, even with no new sample.
+        assert_eq!(gate(&mut p, None, 1.0, at(600), hold), Some(1.5));
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn gate_cancels_increase_that_flips_back() {
+        let t0 = Instant::now();
+        let hold = Duration::from_millis(500);
+        let mut p = None;
+        assert_eq!(gate(&mut p, Some(1.5), 1.0, t0, hold), None);
+        // Back to the current target before the hold elapsed: nothing fires.
+        assert_eq!(gate(&mut p, Some(1.0), 1.0, t0 + Duration::from_millis(200), hold), None);
+        assert_eq!(gate(&mut p, None, 1.0, t0 + Duration::from_millis(900), hold), None);
+        // Zero hold = immediate.
+        assert_eq!(gate(&mut p, Some(1.5), 1.0, t0, Duration::ZERO), Some(1.5));
+    }
+
+    #[test]
     fn smoothstep_shape() {
         assert_eq!(smoothstep(0.0), 0.0);
         assert_eq!(smoothstep(1.0), 1.0);
@@ -828,49 +1188,23 @@ mod tests {
     }
 
     #[test]
-    fn zone_rects_stay_on_screen() {
-        // Landscape, portrait, square, tiny, huge — and size extremes.
-        for &(w, h) in &[(1920, 1080), (1080, 1920), (800, 800), (100, 60), (7680, 2160)] {
-            for &pct in &[2u32, 8, 50, 100] {
-                for (i, &(x, y, z)) in zone_rects(w, h, &[pct; 5], &[(crate::POS_AUTO, crate::POS_AUTO); 5]).iter().enumerate() {
-                    assert!(z >= 1, "zone {i} empty at {w}x{h} pct {pct}");
-                    assert!(
-                        x + z <= w && y + z <= h,
-                        "zone {i} off-screen at {w}x{h} pct {pct}: ({x},{y},{z})"
-                    );
-                }
-            }
-        }
+    fn is_excluded_matches_exe_names() {
+        assert!(is_excluded("photoshop.exe", "photoshop.exe"));
+        assert!(is_excluded(" GIMP.exe ; photoshop.exe,\"krita.exe\"", "krita.exe"));
+        assert!(is_excluded("a.exe\nb.exe", "b.exe"));
+        assert!(!is_excluded("photoshop.exe", "photoshop"));
+        assert!(!is_excluded("", "game.exe"));
+        assert!(!is_excluded(" , ;", ""));
     }
 
     #[test]
-    fn custom_position_centres_zone_and_clamps_on_screen() {
-        let a = crate::POS_AUTO;
-        let mut pos = [(a, a); 5];
-        pos[1] = (500, 500); // top-left zone dragged to the middle
-        pos[2] = (1000, 0); // pushed into the top-right corner
-        let r = zone_rects(1000, 1000, &[10; 5], &pos);
-        assert_eq!(r[1], (450, 450, 100)); // centred
-        assert_eq!(r[2], (900, 0, 100)); // clamped fully on-screen
-        // Untouched zones keep their default anchors.
-        assert_eq!(r[0], zone_rects(1000, 1000, &[10; 5], &[(a, a); 5])[0]);
-    }
-
-    #[test]
-    fn zone_rects_matches_overlay_test_copy() {
-        // overlay_layout's tests carry a copy of zone_rects so they run
-        // without the Windows engine; keep the copy honest.
-        for &(w, h) in &[(1920, 1080), (1080, 1920), (800, 800), (100, 60), (7680, 2160)] {
-            for sizes in [[2u32; 5], [8; 5], [100; 5], [3, 17, 50, 9, 100]] {
-                let a = crate::POS_AUTO;
-                let pos = [(a, a), (0, 0), (1000, 1000), (500, 250), (a, 700)];
-                assert_eq!(
-                    zone_rects(w, h, &sizes, &pos),
-                    crate::overlay_layout::tests::zones(w, h, &sizes, &pos),
-                    "{w}x{h} {sizes:?} {pos:?}"
-                );
-            }
-        }
+    fn ramps_differ_ignores_rounding_only() {
+        let a = [30000u16; 768];
+        let mut b = a;
+        b[100] += 800; // driver rounding: same ramp
+        assert!(!ramps_differ(&a, &b));
+        b[100] += 600; // real external change
+        assert!(ramps_differ(&a, &b));
     }
 
     #[test]
@@ -889,24 +1223,43 @@ mod tests {
     }
 }
 
+/// HDR is on when the output's colour space is HDR10 (PQ / BT.2020).
+unsafe fn output_is_hdr(output: &IDXGIOutput) -> bool {
+    output
+        .cast::<IDXGIOutput6>()
+        .ok()
+        .and_then(|o| o.GetDesc1().ok())
+        .is_some_and(|d| d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+}
+
+/// The output of the monitor Windows calls primary (the one the gamma ramp is
+/// written to). Matched by monitor handle, not position: cloned displays share
+/// (0,0). Falls back to "the attached output at the origin".
 unsafe fn find_primary_output(
     factory: &IDXGIFactory1,
 ) -> windows::core::Result<(IDXGIAdapter1, IDXGIOutput)> {
+    let primary = primary_monitor().map(|(m, _)| m);
+    let mut fallback: Option<(IDXGIAdapter1, IDXGIOutput)> = None;
     let mut i = 0;
-    loop {
-        let adapter = factory.EnumAdapters1(i)?;
+    while let Ok(adapter) = factory.EnumAdapters1(i) {
         let mut j = 0;
         while let Ok(output) = adapter.EnumOutputs(j) {
             if let Ok(desc) = output.GetDesc() {
-                if desc.AttachedToDesktop.as_bool()
-                    && desc.DesktopCoordinates.left == 0
-                    && desc.DesktopCoordinates.top == 0
-                {
-                    return Ok((adapter, output));
+                if desc.AttachedToDesktop.as_bool() {
+                    if primary == Some(desc.Monitor) {
+                        return Ok((adapter, output));
+                    }
+                    if fallback.is_none()
+                        && desc.DesktopCoordinates.left == 0
+                        && desc.DesktopCoordinates.top == 0
+                    {
+                        fallback = Some((adapter.clone(), output));
+                    }
                 }
             }
             j += 1;
         }
         i += 1;
     }
+    fallback.ok_or_else(|| windows::Win32::Graphics::Dxgi::DXGI_ERROR_NOT_FOUND.into())
 }

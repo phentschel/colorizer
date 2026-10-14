@@ -70,7 +70,7 @@ impl Rect {
     }
 }
 
-/// Zone rectangle as produced by `engine::zone_rects`: (x, y, side).
+/// Zone rectangle as produced by `zone_rects`: (x, y, side).
 pub fn zone_rect(z: (u32, u32, u32)) -> Rect {
     Rect::new(z.0 as i32, z.1 as i32, z.2 as i32, z.2 as i32)
 }
@@ -200,47 +200,80 @@ pub fn unpack_origin(v: u64) -> (i32, i32) {
     ((v >> 32) as u32 as i32, v as u32 as i32)
 }
 
+/// Edge of one sampled patch in pixels; also the smallest a zone can be.
+pub const PATCH: u32 = 16;
+
+/// Square zone rectangles (x, y, side) in desktop pixels, from per-zone size
+/// percentages of the smaller screen dimension (2-100%). A zone without a
+/// custom position sits at its default anchor (center, or a corner inset 5%);
+/// one with a position is centred on that point (permille of the screen).
+/// Either way it is clamped fully on-screen. Also used by the UI preview and
+/// the overlay.
+pub fn zone_rects(
+    w: u32,
+    h: u32,
+    sizes: &[u32; 5],
+    pos: &[(u32, u32); 5],
+) -> [(u32, u32, u32); 5] {
+    let dim = w.min(h).max(PATCH);
+    let px = sizes.map(|pct| (dim * pct.clamp(2, 100) / 100).clamp(PATCH, dim));
+    let inset_x = w / 20;
+    let inset_y = h / 20;
+    let auto = [
+        ((w - px[0]) / 2, (h - px[0]) / 2, px[0]),                                   // center
+        (inset_x.min(w - px[1]), inset_y.min(h - px[1]), px[1]),                     // top-left
+        (w.saturating_sub(inset_x + px[2]), inset_y.min(h - px[2]), px[2]),          // top-right
+        (inset_x.min(w - px[3]), h.saturating_sub(inset_y + px[3]), px[3]),          // bottom-left
+        (w.saturating_sub(inset_x + px[4]), h.saturating_sub(inset_y + px[4]), px[4]), // bottom-right
+    ];
+    std::array::from_fn(|i| {
+        let (ax, ay) = pos[i];
+        if ax > crate::POS_MAX || ay > crate::POS_MAX {
+            return auto[i];
+        }
+        let s = px[i];
+        let cx = (w as u64 * ax as u64 / crate::POS_MAX as u64) as u32;
+        let cy = (h as u64 * ay as u64 / crate::POS_MAX as u64) as u32;
+        (cx.saturating_sub(s / 2).min(w - s), cy.saturating_sub(s / 2).min(h - s), s)
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    /// Same as engine::zone_rects; duplicated here only so this module's tests
-    /// run without the Windows-only engine. `zone_rects_matches_engine` in
-    /// engine.rs keeps the two in lockstep.
-    pub(crate) fn zones(
-        w: u32,
-        h: u32,
-        sizes: &[u32; 5],
-        pos: &[(u32, u32); 5],
-    ) -> [(u32, u32, u32); 5] {
-        const PATCH: u32 = 16;
-        let dim = w.min(h).max(PATCH);
-        let px = sizes.map(|pct| (dim * pct.clamp(2, 100) / 100).clamp(PATCH, dim));
-        let inset_x = w / 20;
-        let inset_y = h / 20;
-        let auto = [
-            ((w - px[0]) / 2, (h - px[0]) / 2, px[0]),
-            (inset_x.min(w - px[1]), inset_y.min(h - px[1]), px[1]),
-            (w.saturating_sub(inset_x + px[2]), inset_y.min(h - px[2]), px[2]),
-            (inset_x.min(w - px[3]), h.saturating_sub(inset_y + px[3]), px[3]),
-            (w.saturating_sub(inset_x + px[4]), h.saturating_sub(inset_y + px[4]), px[4]),
-        ];
-        std::array::from_fn(|i| {
-            let (ax, ay) = pos[i];
-            if ax > crate::POS_MAX || ay > crate::POS_MAX {
-                return auto[i];
-            }
-            let s = px[i];
-            let cx = (w as u64 * ax as u64 / crate::POS_MAX as u64) as u32;
-            let cy = (h as u64 * ay as u64 / crate::POS_MAX as u64) as u32;
-            (cx.saturating_sub(s / 2).min(w - s), cy.saturating_sub(s / 2).min(h - s), s)
-        })
-    }
 
     const SCREENS: [(u32, u32); 6] =
         [(1920, 1080), (2560, 1440), (3840, 2160), (1080, 1920), (800, 800), (100, 60)];
     const LABEL: [(i32, i32); 5] = [(120, 18); 5];
     const AUTO: [(u32, u32); 5] = [(crate::POS_AUTO, crate::POS_AUTO); 5];
+
+    #[test]
+    fn zone_rects_stay_on_screen() {
+        // Landscape, portrait, square, tiny, huge — and size extremes.
+        for &(w, h) in &[(1920, 1080), (1080, 1920), (800, 800), (100, 60), (7680, 2160)] {
+            for &pct in &[2u32, 8, 50, 100] {
+                for (i, &(x, y, z)) in zone_rects(w, h, &[pct; 5], &AUTO).iter().enumerate() {
+                    assert!(z >= 1, "zone {i} empty at {w}x{h} pct {pct}");
+                    assert!(
+                        x + z <= w && y + z <= h,
+                        "zone {i} off-screen at {w}x{h} pct {pct}: ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_position_centres_zone_and_clamps_on_screen() {
+        let mut pos = AUTO;
+        pos[1] = (500, 500); // top-left zone dragged to the middle
+        pos[2] = (1000, 0); // pushed into the top-right corner
+        let r = zone_rects(1000, 1000, &[10; 5], &pos);
+        assert_eq!(r[1], (450, 450, 100)); // centred
+        assert_eq!(r[2], (900, 0, 100)); // clamped fully on-screen
+        // Untouched zones keep their default anchors.
+        assert_eq!(r[0], zone_rects(1000, 1000, &[10; 5], &AUTO)[0]);
+    }
 
     #[test]
     fn dragged_position_roundtrips_to_the_same_centre() {
@@ -249,7 +282,7 @@ pub(crate) mod tests {
             for &(cx, cy) in &[(0i32, 0i32), (w as i32 / 2, h as i32 / 3), (w as i32, h as i32)] {
                 let mut pos = [(crate::POS_AUTO, crate::POS_AUTO); 5];
                 pos[1] = pos_from_center(cx, cy, w, h);
-                let (x, y, s) = zones(w, h, &sizes, &pos)[1];
+                let (x, y, s) = zone_rects(w, h, &sizes, &pos)[1];
                 // Within one permille step (plus the on-screen clamp).
                 let (mx, my) = ((x + s / 2) as i32, (y + s / 2) as i32);
                 let tol_x = (w as i32 / 1000 + 1).max(s as i32 / 2 + 1);
@@ -265,7 +298,7 @@ pub(crate) mod tests {
     fn borders_never_touch_their_own_zone() {
         for &(w, h) in &SCREENS {
             for pct in [2u32, 8, 20, 50, 100] {
-                let zs = zones(w, h, &[pct; 5], &AUTO);
+                let zs = zone_rects(w, h, &[pct; 5], &AUTO);
                 let l = layout(w, h, &zs, 3, &LABEL);
                 for (i, bar) in &l.bars {
                     let z = zone_rect(zs[*i]);
@@ -280,7 +313,7 @@ pub(crate) mod tests {
         // With the default sizes nothing the overlay draws — borders or
         // labels — may land in any measured zone, or it would skew sampling.
         for &(w, h) in &SCREENS[..5] {
-            let zs = zones(w, h, &[8; 5], &AUTO);
+            let zs = zone_rects(w, h, &[8; 5], &AUTO);
             let l = layout(w, h, &zs, 3, &LABEL);
             for (_, item) in l.bars.iter().chain(&l.labels) {
                 for (j, z) in zs.iter().enumerate() {
@@ -294,7 +327,7 @@ pub(crate) mod tests {
     fn everything_stays_on_screen() {
         for &(w, h) in &SCREENS {
             for pct in [2u32, 8, 50, 100] {
-                let zs = zones(w, h, &[pct; 5], &AUTO);
+                let zs = zone_rects(w, h, &[pct; 5], &AUTO);
                 let l = layout(w, h, &zs, 4, &[(300, 30); 5]);
                 let screen = Rect::new(0, 0, w as i32, h as i32);
                 for (_, r) in l.bars.iter().chain(&l.labels) {
@@ -307,7 +340,7 @@ pub(crate) mod tests {
 
     #[test]
     fn every_zone_gets_a_border_and_a_label() {
-        let zs = zones(1920, 1080, &[8; 5], &AUTO);
+        let zs = zone_rects(1920, 1080, &[8; 5], &AUTO);
         let l = layout(1920, 1080, &zs, 2, &LABEL);
         for i in 0..5 {
             assert_eq!(l.bars.iter().filter(|(z, _)| *z == i).count(), 4, "zone {i} bars");
@@ -319,7 +352,7 @@ pub(crate) mod tests {
     fn label_goes_above_or_falls_back_below() {
         let s = 2;
         // Center zone has plenty of room above.
-        let zs = zones(1920, 1080, &[8; 5], &AUTO);
+        let zs = zone_rects(1920, 1080, &[8; 5], &AUTO);
         let l = layout(1920, 1080, &zs, s, &LABEL);
         let center = zone_rect(zs[0]);
         let lab = l.labels.iter().find(|(i, _)| *i == 0).unwrap().1;
@@ -361,7 +394,7 @@ pub(crate) mod tests {
 
     #[test]
     fn bounds_cover_everything_but_not_the_whole_screen() {
-        let zs = zones(1920, 1080, &[8; 5], &AUTO);
+        let zs = zone_rects(1920, 1080, &[8; 5], &AUTO);
         let l = layout(1920, 1080, &zs, 3, &LABEL);
         let b = l.bounds.expect("non-empty layout");
         for (_, r) in l.bars.iter().chain(&l.labels) {

@@ -27,6 +27,9 @@ pub struct Config {
     /// Time when the boost decreases (scene got brighter) — kept short so a
     /// suddenly bright screen stops glaring quickly.
     pub transition_down_ms: u32,
+    /// A boost increase (scene got darker) must persist this long before it
+    /// is applied, so fast cuts don't pump the boost. Decreases are immediate.
+    pub hold_ms: u32,
     /// Screen sampling interval.
     pub sample_ms: u32,
     /// Influence of each zone (center, TL, TR, BL, BR), 0-10.
@@ -66,6 +69,7 @@ impl Default for Config {
             bright_gamma: 1.0,
             transition_ms: 800,
             transition_down_ms: 200,
+            hold_ms: 600,
             sample_ms: 500,
             zone_weights: [2, 1, 1, 1, 1],
             zone_sizes: [8; 5],
@@ -121,6 +125,19 @@ pub struct Shared {
     /// Currently applied gamma * 1000.
     pub gamma_milli: AtomicU32,
     pub capture_ok: AtomicBool,
+    /// Capture is off because HDR is on for the primary display.
+    pub hdr_active: AtomicBool,
+    /// False when Windows refused the toggle hotkey (another program has it).
+    pub hotkey_ok: AtomicBool,
+    /// False when the files crash recovery depends on can't be written.
+    pub recovery_ok: AtomicBool,
+    /// Executable names (comma/semicolon/newline separated) that switch the
+    /// boost off while one of them is the foreground window.
+    pub exclude: Mutex<String>,
+    /// Last foreground exe that wasn't AutoBright itself (for "Add last app").
+    pub last_app: Mutex<String>,
+    /// The boost is currently held off by an excluded foreground app.
+    pub suppressed: AtomicBool,
     /// False while the driver rejects our gamma ramp.
     pub gamma_ok: AtomicBool,
     /// Measured screen size, packed (width << 32) | height; 0 = unknown.
@@ -220,12 +237,36 @@ pub fn save_config(cfg: &Config) {
         .map(|(x, y)| if x > POS_MAX || y > POS_MAX { "auto".to_string() } else { format!("{x}:{y}") })
         .join(",");
     let s = format!(
-        "enabled={}\ndark_point={}\nbright_point={}\ndark_gamma={}\nbright_gamma={}\ntransition_ms={}\ntransition_down_ms={}\nsample_ms={}\nzone_weights={}\nzone_sizes={}\nzone_pos={}\nhotkey_mods={}\nhotkey_vk={}\n",
+        "enabled={}\ndark_point={}\nbright_point={}\ndark_gamma={}\nbright_gamma={}\ntransition_ms={}\ntransition_down_ms={}\nhold_ms={}\nsample_ms={}\nzone_weights={}\nzone_sizes={}\nzone_pos={}\nhotkey_mods={}\nhotkey_vk={}\n",
         cfg.enabled, cfg.dark_point, cfg.bright_point, cfg.dark_gamma, cfg.bright_gamma,
-        cfg.transition_ms, cfg.transition_down_ms, cfg.sample_ms, list(&cfg.zone_weights), list(&cfg.zone_sizes),
+        cfg.transition_ms, cfg.transition_down_ms, cfg.hold_ms, cfg.sample_ms, list(&cfg.zone_weights), list(&cfg.zone_sizes),
         pos, cfg.hotkey_mods, cfg.hotkey_vk
     );
-    let _ = std::fs::write(path, s);
+    // Temp file + rename: a crash mid-write must not leave a torn config.
+    let tmp = path.with_extension("tmp");
+    let ok = std::fs::write(&tmp, s).and_then(|_| std::fs::rename(&tmp, &path)).is_ok();
+    CONFIG_SAVE_FAILED.store(!ok, Ordering::Relaxed);
+}
+
+/// Set when the last attempt to write the settings file failed; shown in the UI.
+pub static CONFIG_SAVE_FAILED: AtomicBool = AtomicBool::new(false);
+
+fn exclude_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("exclude.txt"))
+}
+
+fn load_exclude() -> String {
+    exclude_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn save_exclude(list: &str) {
+    if let Some(p) = exclude_path() {
+        let ok = std::fs::write(p, list).is_ok();
+        CONFIG_SAVE_FAILED.store(!ok, Ordering::Relaxed);
+    }
 }
 
 fn load_config() -> Config {
@@ -244,6 +285,7 @@ fn load_config() -> Config {
             "transition_down_ms" => {
                 cfg.transition_down_ms = v.trim().parse().unwrap_or(cfg.transition_down_ms)
             }
+            "hold_ms" => cfg.hold_ms = v.trim().parse().unwrap_or(cfg.hold_ms),
             "sample_ms" => cfg.sample_ms = v.trim().parse().unwrap_or(cfg.sample_ms),
             "zone_weights" => parse_list(v, &mut cfg.zone_weights),
             "zone_sizes" => parse_list(v, &mut cfg.zone_sizes),
@@ -287,6 +329,7 @@ fn sanitize(cfg: &mut Config) {
     cfg.bright_gamma = cfg.bright_gamma.clamp(0.5, 1.0);
     cfg.transition_ms = cfg.transition_ms.clamp(0, 5000);
     cfg.transition_down_ms = cfg.transition_down_ms.clamp(0, 5000);
+    cfg.hold_ms = cfg.hold_ms.clamp(0, 5000);
     cfg.sample_ms = cfg.sample_ms.clamp(100, 5000);
     for w in &mut cfg.zone_weights {
         *w = (*w).min(10);
@@ -324,6 +367,7 @@ mod tests {
             bright_gamma: 2.0,
             transition_ms: 99999,
             transition_down_ms: 99999,
+            hold_ms: 99999,
             sample_ms: 1,
             zone_weights: [99; 5],
             zone_sizes: [0; 5],
@@ -337,6 +381,7 @@ mod tests {
         assert_eq!(cfg.dark_gamma, 3.0);
         assert_eq!(cfg.bright_gamma, 1.0); // bright never boosts
         assert_eq!(cfg.transition_ms, 5000);
+        assert_eq!(cfg.hold_ms, 5000);
         assert_eq!(cfg.sample_ms, 100);
         assert_eq!(cfg.zone_weights, [10; 5]);
         assert_eq!(cfg.zone_sizes, [2; 5]);
@@ -444,6 +489,8 @@ struct App {
     /// Set when the UI edited the config; saved to disk 500ms after the last
     /// edit so slider drags don't write every frame.
     dirty_at: Option<std::time::Instant>,
+    /// Same debounce for the excluded-apps list.
+    exclude_dirty_at: Option<std::time::Instant>,
 }
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -522,7 +569,7 @@ impl App {
         // Drag a zone to where it should measure. The grab offset keeps the
         // zone from jumping so its centre is under the pointer.
         let drag_id = resp.id.with("zone_drag");
-        let rects = engine::zone_rects(sw, sh, &cfg.zone_sizes, &cfg.zone_pos);
+        let rects = overlay_layout::zone_rects(sw, sh, &cfg.zone_sizes, &cfg.zone_pos);
         if resp.drag_started() {
             let hit = resp.interact_pointer_pos().and_then(|pt| {
                 let (px, py) = ((pt.x - origin.x) / scale, (pt.y - origin.y) / scale);
@@ -546,7 +593,7 @@ impl App {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
 
-        for (i, &(x, y, z)) in engine::zone_rects(sw, sh, &cfg.zone_sizes, &cfg.zone_pos).iter().enumerate() {
+        for (i, &(x, y, z)) in overlay_layout::zone_rects(sw, sh, &cfg.zone_sizes, &cfg.zone_pos).iter().enumerate() {
             let rect = egui::Rect::from_min_size(
                 origin + egui::vec2(x as f32 * scale, y as f32 * scale),
                 egui::Vec2::splat(z as f32 * scale),
@@ -657,6 +704,10 @@ impl eframe::App for App {
             .map(|t| t.saturating_duration_since(std::time::Instant::now()));
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
             let hk = hotkey_label(cfg.hotkey_mods, cfg.hotkey_vk);
             ui.checkbox(&mut cfg.enabled, format!("Auto brightness enabled ({hk})"));
             if ui.checkbox(&mut self.autostart, "Start with Windows").changed() {
@@ -688,16 +739,50 @@ impl eframe::App for App {
             }
             ui.separator();
 
-            if cfg.enabled && !self.shared.gamma_ok.load(Ordering::Relaxed) {
+            if !self.shared.gamma_ok.load(Ordering::Relaxed) {
                 ui.colored_label(
                     egui::Color32::YELLOW,
                     "Driver rejected the gamma ramp — try a lower gamma value",
                 );
             }
-            if !capture_ok && cfg.enabled {
+            if cfg.hotkey_vk != 0 && !self.shared.hotkey_ok.load(Ordering::Relaxed) {
                 ui.colored_label(
                     egui::Color32::YELLOW,
-                    "Screen capture unavailable (exclusive fullscreen or HDR?) — retrying",
+                    format!(
+                        "Hotkey {} is already used by another program — pick a different one",
+                        hotkey_label(cfg.hotkey_mods, cfg.hotkey_vk)
+                    ),
+                );
+            }
+            if CONFIG_SAVE_FAILED.load(Ordering::Relaxed) {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Settings could not be saved (disk full or folder not writable)",
+                );
+            }
+            if !self.shared.recovery_ok.load(Ordering::Relaxed) {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Crash-recovery files can't be written — if AutoBright is killed \
+                     while boosting, run it once with --restore",
+                );
+            }
+            if self.shared.suppressed.load(Ordering::Relaxed) {
+                ui.colored_label(
+                    egui::Color32::LIGHT_BLUE,
+                    "Boost held off: an excluded app is in the foreground",
+                );
+            }
+            if !capture_ok && cfg.enabled && self.shared.hdr_active.load(Ordering::Relaxed) {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "HDR is on for the main display — gamma boost has no effect in HDR. \
+                     Turn HDR off in Windows display settings to use AutoBright.",
+                );
+            } else if !capture_ok && cfg.enabled {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Screen capture unavailable (exclusive fullscreen?) — retrying",
                 );
             } else if measured == u32::MAX {
                 ui.label("Screen brightness: (no sample yet)");
@@ -729,7 +814,7 @@ impl eframe::App for App {
                     if val.is_nan() {
                         ui.colored_label(
                             egui::Color32::YELLOW,
-                            "Calibration failed — no screen sample (fullscreen/HDR?)",
+                            "Calibration failed — no screen sample (fullscreen, or HDR on?)",
                         );
                     } else {
                         ui.colored_label(
@@ -831,10 +916,47 @@ impl eframe::App for App {
                     .step_by(50.0),
             );
             ui.add(
+                egui::Slider::new(&mut cfg.hold_ms, 0..=5000)
+                    .text("Hold before boost increase (ms)")
+                    .step_by(50.0),
+            );
+            ui.add(
                 egui::Slider::new(&mut cfg.sample_ms, 100..=5000)
                     .text("Sample interval (ms)")
                     .step_by(50.0),
             );
+            ui.separator();
+
+            ui.heading("Excluded apps");
+            ui.label("No boost while one of these is in the foreground (e.g. photo editors).");
+            let mut excl = self.shared.exclude.lock().unwrap().clone();
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut excl)
+                    .hint_text("photoshop.exe, krita.exe")
+                    .desired_width(f32::INFINITY),
+            );
+            let mut excl_changed = r.changed();
+            let last_app = self.shared.last_app.lock().unwrap().clone();
+            if ui
+                .add_enabled(
+                    !last_app.is_empty(),
+                    egui::Button::new(format!(
+                        "Add last used app{}",
+                        if last_app.is_empty() { String::new() } else { format!(": {last_app}") }
+                    )),
+                )
+                .clicked()
+            {
+                if !excl.trim().is_empty() {
+                    excl.push_str(", ");
+                }
+                excl.push_str(&last_app);
+                excl_changed = true;
+            }
+            if excl_changed {
+                *self.shared.exclude.lock().unwrap() = excl;
+                self.exclude_dirty_at = Some(std::time::Instant::now());
+            }
             ui.separator();
 
             ui.heading("Toggle hotkey");
@@ -881,6 +1003,7 @@ impl eframe::App for App {
                     act_reset_display = true;
                 }
             });
+            });
         });
 
         if let Some(mins) = act_pause {
@@ -913,6 +1036,10 @@ impl eframe::App for App {
         if self.dirty_at.is_some_and(|t| t.elapsed() > Duration::from_millis(500)) {
             save_config(&self.shared.cfg.lock().unwrap());
             self.dirty_at = None;
+        }
+        if self.exclude_dirty_at.is_some_and(|t| t.elapsed() > Duration::from_millis(500)) {
+            save_exclude(&self.shared.exclude.lock().unwrap());
+            self.exclude_dirty_at = None;
         }
         let enabled = self.shared.cfg.lock().unwrap().enabled;
         if enabled != self.toggle_checked {
@@ -967,6 +1094,9 @@ impl eframe::App for App {
         if self.dirty_at.take().is_some() {
             save_config(&self.shared.cfg.lock().unwrap());
         }
+        if self.exclude_dirty_at.take().is_some() {
+            save_exclude(&self.shared.exclude.lock().unwrap());
+        }
         self.shared.running.store(false, Ordering::Relaxed);
         if let Some(h) = self.worker.take() {
             let _ = h.join(); // worker restores the original gamma ramp on exit
@@ -987,10 +1117,42 @@ fn attach_console() {
     }
 }
 
+/// Starts the crash-recovery sibling (`--watchdog <our pid>`), see engine::watchdog.
+fn spawn_watchdog() {
+    use std::os::windows::process::CommandExt;
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(exe)
+            .arg("--watchdog")
+            .arg(std::process::id().to_string())
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn();
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    // Applies a temporary boost, so it must not run against a live instance.
+    if std::env::args().any(|a| a == "--probe-ramp") {
+        attach_console();
+        if engine::instance_running() {
+            println!("probe-ramp: AutoBright is running — quit it from the tray first");
+        } else {
+            engine::probe_ramp();
+        }
+        return Ok(());
+    }
+
     if std::env::args().any(|a| a == "--probe") {
         attach_console();
         engine::probe();
+        return Ok(());
+    }
+
+    // Sibling process that repairs the ramp if the app is killed mid-boost.
+    // Must precede the instance mutex: it is not an instance itself.
+    if let Some(i) = std::env::args().position(|a| a == "--watchdog") {
+        if let Some(pid) = std::env::args().nth(i + 1).and_then(|p| p.parse().ok()) {
+            engine::watchdog(pid);
+        }
         return Ok(());
     }
 
@@ -1024,12 +1186,20 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    spawn_watchdog();
+
     let shared = Arc::new(Shared {
         cfg: Mutex::new(load_config()),
         running: AtomicBool::new(true),
         measured: AtomicU32::new(u32::MAX),
         gamma_milli: AtomicU32::new(1000),
         capture_ok: AtomicBool::new(false),
+        hdr_active: AtomicBool::new(false),
+        hotkey_ok: AtomicBool::new(true),
+        recovery_ok: AtomicBool::new(true),
+        exclude: Mutex::new(load_exclude()),
+        last_app: Mutex::new(String::new()),
+        suppressed: AtomicBool::new(false),
         gamma_ok: AtomicBool::new(true),
         screen_dims: AtomicU64::new(0),
         screen_origin: AtomicU64::new(0),
@@ -1055,6 +1225,8 @@ fn main() -> eframe::Result<()> {
         "AutoBright",
         options,
         Box::new(move |cc| {
+            // Solid scrollbar: the default floating one only appears on hover.
+            cc.egui_ctx.style_mut(|s| s.spacing.scroll = egui::style::ScrollStyle::solid());
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, Submenu};
             use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -1177,6 +1349,7 @@ fn main() -> eframe::Result<()> {
                 autostart: autostart_enabled(),
                 last_respawn: None,
                 dirty_at: None,
+                exclude_dirty_at: None,
             }))
         }),
     )

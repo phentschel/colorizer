@@ -250,7 +250,7 @@ fn begin_drag(hwnd: HWND, x: i32, y: i32) {
     let Some(shared) = SHARED.with(|s| s.borrow().clone()) else { return };
     let Some(((cx, cy), (w, h))) = cursor_local(&shared) else { return };
     let cfg = *shared.cfg.lock().unwrap();
-    let (zx, zy, zs) = crate::engine::zone_rects(w, h, &cfg.zone_sizes, &cfg.zone_pos)[zone];
+    let (zx, zy, zs) = crate::overlay_layout::zone_rects(w, h, &cfg.zone_sizes, &cfg.zone_pos)[zone];
     let centre = (zx as i32 + zs as i32 / 2, zy as i32 + zs as i32 / 2);
     DRAG.with(|d| d.set(Some(Drag { zone, dx: cx - centre.0, dy: cy - centre.1 })));
     unsafe {
@@ -340,7 +340,7 @@ fn apply(hwnd: HWND, s: &Snapshot) {
         SelectObject(hdc, old);
         ReleaseDC(Some(hwnd), hdc);
 
-        let zones = crate::engine::zone_rects(s.dims.0, s.dims.1, &s.sizes, &s.pos);
+        let zones = crate::overlay_layout::zone_rects(s.dims.0, s.dims.1, &s.sizes, &s.pos);
         let mut layout = overlay_layout::layout(s.dims.0, s.dims.1, &zones, stroke, &sizes);
         let Some(bounds) = layout.bounds else {
             let _ = ShowWindow(hwnd, SW_HIDE);
