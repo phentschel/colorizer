@@ -23,7 +23,7 @@ use windows::Win32::Foundation::{CloseHandle, HMODULE, POINT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_FLAG_DO_NOT_WAIT,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE,
     D3D11_MAP_READ,
     D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
@@ -33,7 +33,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutput6,
-    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_ERROR_WAS_STILL_DRAWING,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT,
     DXGI_OUTDUPL_DESC,
     DXGI_OUTDUPL_FRAME_INFO,
 };
@@ -157,6 +157,7 @@ pub fn probe_ramp() {
     };
     let mut gamma = Gamma::new();
     gamma.set(2.0);
+    println!("probe-ramp: driver accepted boost 2.0: {}", gamma.ok);
     let after = next(&mut cap);
     drop(gamma); // restores the original ramp
     match after {
@@ -407,13 +408,7 @@ fn run(shared: &Shared) {
             }
 
             if let Some(c) = cap.as_mut() {
-                let res = c.sample();
-                // Copy queued but not read back: check again shortly instead of
-                // waiting a whole sample interval (and never block on the GPU).
-                if c.copy_pending {
-                    next_sample = now + Duration::from_millis(20);
-                }
-                match res {
+                match c.sample() {
                     Ok(Some(medians)) => {
                         for (slot, m) in shared.zone_medians.iter().zip(&medians) {
                             slot.store(*m as u32, Relaxed);
@@ -655,29 +650,46 @@ impl Gamma {
         // A DC on the primary display's own device, so the ramp we read, write
         // and restore is that display's, not whatever GetDC(NULL) resolves to.
         let monitor = primary_monitor();
-        let (hdc, owned_dc) = match &monitor {
-            Some((_, dev)) => {
+        // The screen DC is preferred: a DC opened on the display device itself
+        // made the driver do mode-level work while games were running (GPU
+        // crash dumps reported). But when the primary display isn't the one
+        // GetDC(NULL) resolves to, the screen DC can't read or write a ramp at
+        // all, so fall back to a DC on the primary's own device.
+        let mut captured = [0u16; 768];
+        let (mut hdc, mut owned_dc) = (unsafe { GetDC(None) }, false);
+        let mut got = unsafe { GetDeviceGammaRamp(hdc, captured.as_mut_ptr() as *mut _) }.as_bool();
+        if !got {
+            if let Some((_, dev)) = &monitor {
                 let dc = unsafe {
                     CreateDCW(PCWSTR(dev.as_ptr()), PCWSTR::null(), PCWSTR::null(), None)
                 };
-                if dc.is_invalid() {
-                    (unsafe { GetDC(None) }, false)
-                } else {
-                    (dc, true)
+                if !dc.is_invalid() {
+                    got = unsafe { GetDeviceGammaRamp(dc, captured.as_mut_ptr() as *mut _) }
+                        .as_bool();
+                    if got {
+                        unsafe { ReleaseDC(None, hdc) };
+                        (hdc, owned_dc) = (dc, true);
+                    } else {
+                        unsafe { let _ = DeleteDC(dc); }
+                    }
                 }
             }
-            None => (unsafe { GetDC(None) }, false),
-        };
-        let mut captured = [0u16; 768];
-        unsafe {
-            let _ = GetDeviceGammaRamp(hdc, captured.as_mut_ptr() as *mut _);
+        }
+        // A failed read leaves zeros; composing a boost through those writes an
+        // all-black ramp that every driver refuses. Fall back to identity.
+        if !got || !ramp_sane(&captured) {
+            captured = identity_ramp();
         }
         let dir = crate::config_dir();
         let marker = dir.as_ref().is_some_and(|d| d.join(MARKER_FILE).exists());
         let mut original = captured;
         let mut ramp_saved = dir.is_some();
         if marker {
-            match dir.as_ref().and_then(|d| read_ramp(&d.join(RAMP_FILE))) {
+            match dir
+                .as_ref()
+                .and_then(|d| read_ramp(&d.join(RAMP_FILE)))
+                .filter(ramp_sane)
+            {
                 Some(saved) => original = saved,
                 None => ramp_saved = false, // marker but no usable saved ramp
             }
@@ -753,15 +765,10 @@ impl Gamma {
             return;
         }
         if self.applied.is_some() {
+            // Adopting external ramps is disabled: just re-apply our own.
             if ramps_differ(&hw, &self.last_written) {
-                self.original = hw;
-                self.persist_original();
                 self.applied = None; // forces the next set() to rewrite
             }
-        } else if !self.marker && ramps_differ(&hw, &self.original) {
-            self.original = hw;
-            self.last_written = hw;
-            self.persist_original();
         }
     }
 
@@ -826,6 +833,23 @@ fn primary_monitor() -> Option<(HMONITOR, Vec<u16>)> {
         }
         Some((m, mi.szDevice.to_vec()))
     }
+}
+
+fn identity_ramp() -> [u16; 768] {
+    let mut r = [0u16; 768];
+    for i in 0..256 {
+        let v = (i * 257) as u16;
+        r[i] = v;
+        r[i + 256] = v;
+        r[i + 512] = v;
+    }
+    r
+}
+
+/// A usable ramp: each channel is non-decreasing and spans most of the range.
+fn ramp_sane(r: &[u16; 768]) -> bool {
+    r.chunks_exact(256)
+        .all(|ch| ch.windows(2).all(|w| w[0] <= w[1]) && ch[255] >= 32768 && ch[0] <= 32768)
 }
 
 fn write_ramp(path: &std::path::Path, ramp: &[u16; 768]) -> std::io::Result<()> {
@@ -907,8 +931,6 @@ struct Capture {
     /// Desktop position of the duplicated output (where the overlay goes).
     origin: (i32, i32),
     rgba: bool,
-    /// Patch copies are queued on the GPU and not read back yet.
-    copy_pending: bool,
 }
 
 impl Capture {
@@ -984,7 +1006,6 @@ impl Capture {
                 height: h,
                 origin: (coords.left, coords.top),
                 rgba,
-                copy_pending: false,
             })
         }
     }
@@ -992,31 +1013,8 @@ impl Capture {
     /// Ok(None) = nothing to report yet: no new frame (static screen), or the
     /// GPU copy is still in flight.
     /// Ok(Some(medians)) = per-zone median brightness (center, TL, TR, BL, BR).
-    ///
-    /// Two-phase so the CPU never waits on the GPU: one call queues the patch
-    /// copies, a later call (see `copy_pending`) collects them. Blocking in
-    /// Map while a game saturates the GPU used to stall and burn CPU for the
-    /// whole queue; now each call returns immediately.
     fn sample(&mut self) -> windows::core::Result<Option<[u8; 5]>> {
         unsafe {
-            if self.copy_pending {
-                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                match self.ctx.Map(
-                    &self.staging,
-                    0,
-                    D3D11_MAP_READ,
-                    D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
-                    Some(&mut mapped),
-                ) {
-                    Err(e) if e.code() == DXGI_ERROR_WAS_STILL_DRAWING => return Ok(None),
-                    r => r?,
-                }
-                self.copy_pending = false;
-                let medians = self.read_medians(&mapped);
-                self.ctx.Unmap(&self.staging, 0);
-                return Ok(Some(medians));
-            }
-
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut res: Option<IDXGIResource> = None;
             match self.dupl.AcquireNextFrame(0, &mut info, &mut res) {
@@ -1067,10 +1065,12 @@ impl Capture {
             }
             drop(tex);
             let _ = self.dupl.ReleaseFrame();
-            // Submit now; the result is collected on a later call.
-            self.ctx.Flush();
-            self.copy_pending = true;
-            Ok(None)
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.ctx.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let medians = self.read_medians(&mapped);
+            self.ctx.Unmap(&self.staging, 0);
+            Ok(Some(medians))
         }
     }
 

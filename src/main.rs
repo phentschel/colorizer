@@ -1298,6 +1298,14 @@ fn main() -> eframe::Result<()> {
                         resume(&shared);
                     } else {
                         quit_flag.store(true, Ordering::Relaxed);
+                        // Stop the engine now (its Drop restores the ramp) and
+                        // guarantee the process ends even if the UI thread
+                        // never gets to close the window.
+                        shared.running.store(false, Ordering::Relaxed);
+                        std::thread::spawn(|| {
+                            std::thread::sleep(Duration::from_secs(2));
+                            std::process::exit(0);
+                        });
                         // WM_CLOSE reaches the queue even while hidden.
                         unsafe {
                             let _ = PostMessageW(
