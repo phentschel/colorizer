@@ -31,7 +31,10 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC,
     DXGI_OUTDUPL_FRAME_INFO,
 };
-use windows::Win32::Graphics::Gdi::{GetDC, ReleaseDC, HDC};
+use windows::core::PCWSTR;
+use windows::Win32::Graphics::Gdi::{
+    CreateDCW, DeleteDC, EnumDisplayDevicesW, GetDC, ReleaseDC, DISPLAY_DEVICEW, HDC,
+};
 use windows::Win32::UI::ColorSystem::{GetDeviceGammaRamp, SetDeviceGammaRamp};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
@@ -371,8 +374,39 @@ const RAMP_FILE: &str = "original_ramp.bin";
 /// captured ramp is tainted — the saved one is the truth.
 const MARKER_FILE: &str = "boost_active";
 
+/// DC for the primary display device. The generic screen DC (GetDC(None))
+/// fails gamma calls with ERROR_MOD_NOT_FOUND on current AMD drivers, while a
+/// DC created for the display device itself works. Falls back to the screen DC.
+fn open_gamma_dc() -> (HDC, bool) {
+    const ATTACHED: u32 = 0x1;
+    const PRIMARY: u32 = 0x4;
+    unsafe {
+        let mut i = 0;
+        loop {
+            let mut dd = DISPLAY_DEVICEW {
+                cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+                ..Default::default()
+            };
+            if !EnumDisplayDevicesW(PCWSTR::null(), i, &mut dd, 0).as_bool() {
+                break;
+            }
+            if dd.StateFlags.0 & (ATTACHED | PRIMARY) == (ATTACHED | PRIMARY) {
+                let name = PCWSTR(dd.DeviceName.as_ptr());
+                let hdc = CreateDCW(name, name, PCWSTR::null(), None);
+                if !hdc.is_invalid() {
+                    return (hdc, true);
+                }
+            }
+            i += 1;
+        }
+        (GetDC(None), false)
+    }
+}
+
 struct Gamma {
     hdc: HDC,
+    /// True when hdc came from CreateDCW (DeleteDC) rather than GetDC (ReleaseDC).
+    owned_dc: bool,
     original: [u16; 768],
     /// The exact ramp we last wrote to the hardware (original when neutral).
     last_written: [u16; 768],
@@ -385,7 +419,7 @@ struct Gamma {
 
 impl Gamma {
     fn new() -> Self {
-        let hdc = unsafe { GetDC(None) };
+        let (hdc, owned_dc) = open_gamma_dc();
         let mut captured = [0u16; 768];
         unsafe {
             let _ = GetDeviceGammaRamp(hdc, captured.as_mut_ptr() as *mut _);
@@ -402,7 +436,7 @@ impl Gamma {
             // Night Light, …) — refresh the saved copy.
             let _ = write_ramp(&d.join(RAMP_FILE), &captured);
         }
-        Self { hdc, original, last_written: original, applied: None, dir, marker, ok: true }
+        Self { hdc, owned_dc, original, last_written: original, applied: None, dir, marker, ok: true }
     }
 
     fn set(&mut self, g: f32) {
@@ -508,7 +542,11 @@ impl Drop for Gamma {
     fn drop(&mut self) {
         self.restore();
         unsafe {
-            ReleaseDC(None, self.hdc);
+            if self.owned_dc {
+                let _ = DeleteDC(self.hdc);
+            } else {
+                ReleaseDC(None, self.hdc);
+            }
         }
     }
 }
