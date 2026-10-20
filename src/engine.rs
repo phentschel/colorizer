@@ -125,6 +125,7 @@ fn run(shared: &Shared) {
     register_hotkey(hotkey.0, hotkey.1);
 
     // Transition state: eased ramp from `start` to `target` beginning at `t0`.
+    // These are blend positions (0 = dark point, 1 = bright point), not gamma.
     let mut cur = 1.0f32;
     let mut start = 1.0f32;
     let mut target = 1.0f32;
@@ -242,14 +243,15 @@ fn run(shared: &Shared) {
                         // Deadband: ±3 counts of flicker never retargets.
                         if (mf - last_measured).abs() >= 3.0 {
                             last_measured = mf;
-                            let want = target_gamma(&cfg, mf);
+                            let want = blend_pos(&cfg, mf);
                             if (want - target).abs() > 0.005 {
                                 start = cur;
                                 target = want;
                                 t0 = now;
-                                // Less boost = the scene got brighter: ramp
-                                // down fast so it doesn't glare.
-                                let ms = if want < cur {
+                                // Moving toward the bright point = the scene
+                                // got brighter: ramp down fast so it doesn't
+                                // glare.
+                                let ms = if want > cur {
                                     cfg.transition_down_ms
                                 } else {
                                     cfg.transition_ms
@@ -317,8 +319,9 @@ fn run(shared: &Shared) {
             } else {
                 target
             };
-            gamma.set(cur);
-            shared.gamma_milli.store((cur * 1000.0).round() as u32, Relaxed);
+            let g = gamma_at(&cfg, cur);
+            gamma.set(g, cfg.black_lift * (1.0 - cur), cfg.white_drop * cur);
+            shared.gamma_milli.store((g * 1000.0).round() as u32, Relaxed);
             shared.gamma_ok.store(gamma.ok, Relaxed);
         } else {
             gamma.restore();
@@ -350,13 +353,23 @@ fn combine(medians: &[u8; 5], weights: &[u32; 5]) -> u8 {
     (sum / wsum) as u8
 }
 
-fn target_gamma(cfg: &Config, measured: f32) -> f32 {
+/// Position between the dark point (0.0) and the bright point (1.0). Gamma,
+/// black lift and white drop all follow it, so they ease together.
+fn blend_pos(cfg: &Config, measured: f32) -> f32 {
     let span = cfg.bright_point - cfg.dark_point;
     if span < 1.0 {
-        return if measured < cfg.dark_point { cfg.dark_gamma } else { cfg.bright_gamma };
+        return if measured < cfg.dark_point { 0.0 } else { 1.0 };
     }
-    let t = ((measured - cfg.dark_point) / span).clamp(0.0, 1.0);
-    cfg.dark_gamma + (cfg.bright_gamma - cfg.dark_gamma) * t
+    ((measured - cfg.dark_point) / span).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+fn target_gamma(cfg: &Config, measured: f32) -> f32 {
+    gamma_at(cfg, blend_pos(cfg, measured))
+}
+
+fn gamma_at(cfg: &Config, pos: f32) -> f32 {
+    cfg.dark_gamma + (cfg.bright_gamma - cfg.dark_gamma) * pos
 }
 
 fn smoothstep(t: f32) -> f32 {
@@ -410,7 +423,8 @@ struct Gamma {
     original: [u16; 768],
     /// The exact ramp we last wrote to the hardware (original when neutral).
     last_written: [u16; 768],
-    applied: Option<f32>,
+    /// (gamma, black lift, white drop) of the ramp we last wrote.
+    applied: Option<(f32, f32, f32)>,
     dir: Option<std::path::PathBuf>,
     marker: bool,
     /// False when the driver rejected our last SetDeviceGammaRamp.
@@ -439,27 +453,32 @@ impl Gamma {
         Self { hdc, owned_dc, original, last_written: original, applied: None, dir, marker, ok: true }
     }
 
-    fn set(&mut self, g: f32) {
-        if let Some(prev) = self.applied {
-            if (prev - g).abs() < 0.001 {
+    /// `lift` raises black and `drop` lowers white, both on the 0-255 scale.
+    fn set(&mut self, g: f32, lift: f32, drop: f32) {
+        if let Some((pg, pl, pd)) = self.applied {
+            if (pg - g).abs() < 0.001 && (pl - lift).abs() < 0.05 && (pd - drop).abs() < 0.05 {
                 return;
             }
         }
         // Compose the boost through the original ramp so an ICC calibration
-        // or Night Light tint survives while boosted. g == 1.0 maps back to
-        // exactly the original ramp.
+        // or Night Light tint survives while boosted. Neutral settings map
+        // back to exactly the original ramp.
+        let lo = lift as f64 / 255.0 * 65535.0;
+        let hi = 65535.0 - drop as f64 / 255.0 * 65535.0;
         let mut ramp = [0u16; 768];
         let inv = 1.0 / g;
         for i in 0..256 {
             let idx = (((i as f32 / 255.0).powf(inv) * 255.0).round() as usize).min(255);
-            ramp[i] = self.original[idx];
-            ramp[i + 256] = self.original[idx + 256];
-            ramp[i + 512] = self.original[idx + 512];
+            for c in 0..3 {
+                let v = self.original[idx + c * 256] as f64;
+                ramp[i + c * 256] = (lo + v * (hi - lo) / 65535.0).round().clamp(0.0, 65535.0) as u16;
+            }
         }
         self.ok = unsafe { SetDeviceGammaRamp(self.hdc, ramp.as_ptr() as *const _) }.as_bool();
         self.last_written = ramp;
-        self.applied = Some(g);
-        self.set_marker(self.ok && (g - 1.0).abs() > 0.001);
+        self.applied = Some((g, lift, drop));
+        let neutral = (g - 1.0).abs() <= 0.001 && lift < 0.05 && drop < 0.05;
+        self.set_marker(self.ok && !neutral);
     }
 
     fn restore(&mut self) {

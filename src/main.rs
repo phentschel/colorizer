@@ -20,6 +20,10 @@ pub struct Config {
     /// Gamma at/above the bright point; capped at 1.0 so already-bright
     /// screens never get brighter.
     pub bright_gamma: f32,
+    /// Black level raised by this many 0-255 steps at the dark point.
+    pub black_lift: f32,
+    /// White level lowered by this many 0-255 steps at the bright point.
+    pub white_drop: f32,
     /// Time to reach a new brightness target when the boost increases.
     pub transition_ms: u32,
     /// Time when the boost decreases (scene got brighter) — kept short so a
@@ -55,6 +59,8 @@ impl Default for Config {
             bright_point: 130.0,
             dark_gamma: 1.6,
             bright_gamma: 1.0,
+            black_lift: 0.0,
+            white_drop: 0.0,
             transition_ms: 800,
             transition_down_ms: 200,
             sample_ms: 500,
@@ -198,9 +204,9 @@ pub fn save_config(cfg: &Config) {
     let Some(path) = config_path() else { return };
     let list = |a: &[u32; 5]| a.map(|v| v.to_string()).join(",");
     let s = format!(
-        "enabled={}\ndark_point={}\nbright_point={}\ndark_gamma={}\nbright_gamma={}\ntransition_ms={}\ntransition_down_ms={}\nsample_ms={}\nzone_weights={}\nzone_sizes={}\nhotkey_mods={}\nhotkey_vk={}\n",
+        "enabled={}\ndark_point={}\nbright_point={}\ndark_gamma={}\nbright_gamma={}\nblack_lift={}\nwhite_drop={}\ntransition_ms={}\ntransition_down_ms={}\nsample_ms={}\nzone_weights={}\nzone_sizes={}\nhotkey_mods={}\nhotkey_vk={}\n",
         cfg.enabled, cfg.dark_point, cfg.bright_point, cfg.dark_gamma, cfg.bright_gamma,
-        cfg.transition_ms, cfg.transition_down_ms, cfg.sample_ms, list(&cfg.zone_weights), list(&cfg.zone_sizes),
+        cfg.black_lift, cfg.white_drop, cfg.transition_ms, cfg.transition_down_ms, cfg.sample_ms, list(&cfg.zone_weights), list(&cfg.zone_sizes),
         cfg.hotkey_mods, cfg.hotkey_vk
     );
     let _ = std::fs::write(path, s);
@@ -218,6 +224,8 @@ fn load_config() -> Config {
             "bright_point" => cfg.bright_point = v.trim().parse().unwrap_or(cfg.bright_point),
             "dark_gamma" => cfg.dark_gamma = v.trim().parse().unwrap_or(cfg.dark_gamma),
             "bright_gamma" => cfg.bright_gamma = v.trim().parse().unwrap_or(cfg.bright_gamma),
+            "black_lift" => cfg.black_lift = v.trim().parse().unwrap_or(cfg.black_lift),
+            "white_drop" => cfg.white_drop = v.trim().parse().unwrap_or(cfg.white_drop),
             "transition_ms" => cfg.transition_ms = v.trim().parse().unwrap_or(cfg.transition_ms),
             "transition_down_ms" => {
                 cfg.transition_down_ms = v.trim().parse().unwrap_or(cfg.transition_down_ms)
@@ -248,6 +256,8 @@ fn sanitize(cfg: &mut Config) {
     cfg.dark_gamma = cfg.dark_gamma.clamp(1.0, 3.0);
     // Bright scenes must never be boosted above neutral.
     cfg.bright_gamma = cfg.bright_gamma.clamp(0.5, 1.0);
+    cfg.black_lift = cfg.black_lift.clamp(0.0, 40.0);
+    cfg.white_drop = cfg.white_drop.clamp(0.0, 40.0);
     cfg.transition_ms = cfg.transition_ms.clamp(0, 5000);
     cfg.transition_down_ms = cfg.transition_down_ms.clamp(0, 5000);
     cfg.sample_ms = cfg.sample_ms.clamp(100, 5000);
@@ -280,6 +290,8 @@ mod tests {
             bright_point: 0.0,
             dark_gamma: 9.0,
             bright_gamma: 2.0,
+            black_lift: 99.0,
+            white_drop: -5.0,
             transition_ms: 99999,
             transition_down_ms: 99999,
             sample_ms: 1,
@@ -293,6 +305,8 @@ mod tests {
         assert_eq!(cfg.bright_point, 255.0); // >= dark_point + 5
         assert_eq!(cfg.dark_gamma, 3.0);
         assert_eq!(cfg.bright_gamma, 1.0); // bright never boosts
+        assert_eq!(cfg.black_lift, 40.0);
+        assert_eq!(cfg.white_drop, 0.0);
         assert_eq!(cfg.transition_ms, 5000);
         assert_eq!(cfg.sample_ms, 100);
         assert_eq!(cfg.zone_weights, [10; 5]);
@@ -664,6 +678,9 @@ impl eframe::App for App {
             ui.add(egui::Slider::new(&mut cfg.dark_gamma, 1.0..=3.0).text("Gamma at dark point"));
             ui.add(egui::Slider::new(&mut cfg.bright_gamma, 0.5..=1.0).text("Gamma at bright point"));
             ui.label("Bright scenes are never boosted: 1.0 = leave untouched.");
+            ui.add(egui::Slider::new(&mut cfg.black_lift, 0.0..=40.0).text("Black lift at dark point"));
+            ui.add(egui::Slider::new(&mut cfg.white_drop, 0.0..=40.0).text("White drop at bright point"));
+            ui.label("Steps on the 0-255 scale: lift raises black, drop lowers white (less glare).");
             ui.separator();
 
             ui.heading("Zones");
