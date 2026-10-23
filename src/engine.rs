@@ -479,8 +479,17 @@ fn open_gamma_dc() -> (HDC, bool) {
 /// display driver even while the boost is off, so every gamma read or write
 /// opens a fresh one and closes it straight away.
 fn with_dc<R>(f: impl FnOnce(HDC) -> R) -> R {
+    with_dc_timed(f).0
+}
+
+/// `with_dc` that also returns (time to open the DC, time inside `f`).
+fn with_dc_timed<R>(f: impl FnOnce(HDC) -> R) -> (R, Duration, Duration) {
+    let t = Instant::now();
     let (hdc, owned) = open_gamma_dc();
+    let opened = t.elapsed();
+    let t = Instant::now();
     let r = f(hdc);
+    let called = t.elapsed();
     unsafe {
         if owned {
             let _ = DeleteDC(hdc);
@@ -488,7 +497,7 @@ fn with_dc<R>(f: impl FnOnce(HDC) -> R) -> R {
             ReleaseDC(None, hdc);
         }
     }
-    r
+    (r, opened, called)
 }
 
 struct Gamma {
@@ -551,9 +560,10 @@ impl Gamma {
             self.applied = Some((g, lift, drop));
             return;
         }
-        let t = Instant::now();
-        self.ok = with_dc(|hdc| unsafe { SetDeviceGammaRamp(hdc, ramp.as_ptr() as *const _) }.as_bool());
-        self.log_write("set", t.elapsed());
+        let (ok, opened, wrote) =
+            with_dc_timed(|hdc| unsafe { SetDeviceGammaRamp(hdc, ramp.as_ptr() as *const _) }.as_bool());
+        self.ok = ok;
+        self.log_write("set", opened, wrote);
         self.last_written = ramp;
         self.applied = Some((g, lift, drop));
         let neutral = (g - 1.0).abs() <= 0.001 && lift < 0.05 && drop < 0.05;
@@ -561,9 +571,9 @@ impl Gamma {
     }
 
     /// Diagnostics: every ramp write is appended to gamma_timing.log as
-    /// "unix_ms kind took_ms" (kind = set | heal | restore), so a GPU crash can
+    /// "unix_ms kind open_ms write_ms" (kind = set | heal | restore), so a GPU crash can
     /// be lined up against exactly what we did and why. Rotates at 200 KB.
-    fn log_write(&self, kind: &str, took: Duration) {
+    fn log_write(&self, kind: &str, opened: Duration, wrote: Duration) {
         use std::io::Write;
         let Some(d) = &self.dir else { return };
         let path = d.join("gamma_timing.log");
@@ -574,7 +584,12 @@ impl Gamma {
             let ms = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis());
-            let _ = writeln!(f, "{ms} {kind} {:.1}", took.as_secs_f64() * 1000.0);
+            let _ = writeln!(
+                f,
+                "{ms} {kind} {:.1} {:.1}",
+                opened.as_secs_f64() * 1000.0,
+                wrote.as_secs_f64() * 1000.0
+            );
         }
     }
 
@@ -586,11 +601,10 @@ impl Gamma {
 
     fn restore(&mut self) {
         if self.applied.is_some() || self.marker {
-            let t = Instant::now();
-            with_dc(|hdc| unsafe {
+            let (_, opened, wrote) = with_dc_timed(|hdc| unsafe {
                 let _ = SetDeviceGammaRamp(hdc, self.original.as_ptr() as *const _);
             });
-            self.log_write("restore", t.elapsed());
+            self.log_write("restore", opened, wrote);
             self.last_written = self.original;
             self.applied = None;
             self.ok = true;
@@ -610,12 +624,12 @@ impl Gamma {
         }
         if self.applied.is_some() {
             if !ramps_close(&hw, &self.last_written) {
-                let t = Instant::now();
-                self.ok = with_dc(|hdc| unsafe {
+                let (ok, opened, wrote) = with_dc_timed(|hdc| unsafe {
                     SetDeviceGammaRamp(hdc, self.last_written.as_ptr() as *const _)
                 }
                 .as_bool());
-                self.log_write("heal", t.elapsed());
+                self.ok = ok;
+                self.log_write("heal", opened, wrote);
             }
         } else if !self.marker && !ramps_close(&hw, &self.original) {
             self.original = hw;
