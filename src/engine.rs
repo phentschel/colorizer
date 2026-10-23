@@ -11,12 +11,21 @@
 //!   keeps hybrid-GPU laptops on the fast path.
 
 use crate::{Config, Shared};
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use windows::core::Interface;
-use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadInformation, SetThreadPriority, ThreadPowerThrottling,
+    THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+    THREAD_POWER_THROTTLING_STATE, THREAD_PRIORITY_BELOW_NORMAL,
+};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
@@ -39,7 +48,103 @@ use windows::Win32::UI::ColorSystem::{GetDeviceGammaRamp, SetDeviceGammaRamp};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
 };
-use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, MSG, PM_REMOVE, WM_HOTKEY};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowLongPtrW,
+    MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowLongPtrW, GWLP_USERDATA, MSG,
+    PM_REMOVE, QS_HOTKEY, QS_POSTMESSAGE, WINDOW_EX_STYLE, WM_DISPLAYCHANGE, WM_ENDSESSION,
+    WM_HOTKEY, WM_POWERBROADCAST, WNDCLASSW, WS_POPUP,
+};
+
+/// Set by the event window when the display stack is about to change or just
+/// changed (suspend/resume, lock/unlock, mode change). The engine loop drops
+/// the capture and re-reads the ramp. Only a flag is stored here: the handler
+/// never calls into the display driver itself.
+static DISPLAY_EVENT: AtomicBool = AtomicBool::new(false);
+
+const PBT_APMSUSPEND: usize = 0x4;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
+const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const WTS_SESSION_LOCK: usize = 0x7;
+const WTS_SESSION_UNLOCK: usize = 0x8;
+
+/// Window procedure of the hidden event window (engine thread only).
+unsafe extern "system" fn event_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_POWERBROADCAST if wp.0 == PBT_APMSUSPEND || wp.0 == PBT_APMRESUMEAUTOMATIC => {
+            DISPLAY_EVENT.store(true, Relaxed);
+        }
+        WM_DISPLAYCHANGE => DISPLAY_EVENT.store(true, Relaxed),
+        WM_WTSSESSION_CHANGE if wp.0 == WTS_SESSION_LOCK || wp.0 == WTS_SESSION_UNLOCK => {
+            DISPLAY_EVENT.store(true, Relaxed);
+        }
+        // Logoff/shutdown: nothing runs after the system kills us, so put the
+        // ramp back now. The Gamma pointer is set once the engine owns one.
+        WM_ENDSESSION if wp.0 != 0 => {
+            let g = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Gamma;
+            if let Some(g) = g.as_mut() {
+                g.restore();
+            }
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+/// Hidden top-level window on the engine thread. It must be top-level, not
+/// message-only: broadcasts such as WM_DISPLAYCHANGE and WM_ENDSESSION are not
+/// delivered to message-only windows. Never shown.
+fn create_event_window() -> Option<HWND> {
+    unsafe {
+        let hinst = GetModuleHandleW(PCWSTR::null()).ok()?.into();
+        let class = windows::core::w!("AutoBrightEvents");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(event_proc),
+            hInstance: hinst,
+            lpszClassName: class,
+            ..Default::default()
+        };
+        RegisterClassW(&wc); // 0 if already registered (engine restart): fine
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class,
+            class,
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(hinst),
+            None,
+        )
+        .ok()?;
+        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+        Some(hwnd)
+    }
+}
+
+/// Efficiency for a background sampler: below-normal priority so a game never
+/// waits on us, and EcoQoS so the scheduler may run us on efficient cores at a
+/// lower clock. Only this thread; the UI thread keeps normal behaviour. Both
+/// calls are best effort.
+fn lower_thread_priority() {
+    unsafe {
+        let t = GetCurrentThread();
+        let _ = SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+        let state = THREAD_POWER_THROTTLING_STATE {
+            Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        };
+        let _ = SetThreadInformation(
+            t,
+            ThreadPowerThrottling,
+            &state as *const _ as *const _,
+            std::mem::size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
 
 
 pub fn spawn(shared: Arc<Shared>) -> std::thread::JoinHandle<()> {
@@ -106,7 +211,15 @@ fn register_hotkey(mods: u32, vk: u32) {
 }
 
 fn run(shared: &Shared) {
+    lower_thread_priority();
     let mut gamma = Gamma::new();
+    // The event window lets logoff/shutdown restore the ramp from inside the
+    // handler. It borrows `gamma` through GWLP_USERDATA, but only while a
+    // message is dispatched from this loop, never during a Gamma call.
+    let event_hwnd = create_event_window();
+    if let Some(h) = event_hwnd {
+        unsafe { SetWindowLongPtrW(h, GWLP_USERDATA, &mut gamma as *mut Gamma as isize) };
+    }
     let mut cap: Option<Capture> = None;
     let mut next_sample = Instant::now();
     let mut next_reinit = Instant::now();
@@ -146,12 +259,14 @@ fn run(shared: &Shared) {
     let mut last_tick = SystemTime::now();
 
     while shared.running.load(Relaxed) {
-        // Long gap between ticks = the machine slept (or we were frozen). The
-        // display driver resets on resume, so the duplication device and the
+        // Suspend/resume, lock/unlock or a mode change (DISPLAY_EVENT), or, as a
+        // fallback, a long gap between ticks (the machine slept or we were
+        // frozen). The display driver resets, so the duplication device and the
         // display DC are stale: drop them and give the driver a few seconds to
         // settle instead of hammering it with re-creation while it recovers.
         let wall = SystemTime::now();
-        if wall.duration_since(last_tick).is_ok_and(|d| d > Duration::from_secs(5)) {
+        let event = DISPLAY_EVENT.swap(false, Relaxed);
+        if event || wall.duration_since(last_tick).is_ok_and(|d| d > Duration::from_secs(5)) {
             let t = Instant::now();
             cap = None;
             shared.capture_ok.store(false, Relaxed);
@@ -171,6 +286,8 @@ fn run(shared: &Shared) {
                     *c
                 };
                 crate::save_config(&snap);
+            } else {
+                unsafe { DispatchMessageW(&msg) };
             }
         }
 
@@ -391,13 +508,25 @@ fn run(shared: &Shared) {
             cand = None;
         }
 
-        std::thread::sleep(Duration::from_millis(if transitioning {
+        // Wait on the message queue instead of sleeping so the hotkey wakes us
+        // at once; the timeout is the tick. Idle ticks are long: when off,
+        // nothing needs sampling, only the UI's toggle/restore flags are polled.
+        let wait_ms = if transitioning {
             40 // ~25 ramp writes/s is smooth enough for an eased fade
         } else if active {
             50
         } else {
-            100
-        }));
+            250
+        };
+        unsafe { MsgWaitForMultipleObjects(None, false, wait_ms, QS_HOTKEY | QS_POSTMESSAGE) };
+    }
+    if let Some(h) = event_hwnd {
+        unsafe {
+            // Detach before `gamma` drops (which restores the ramp).
+            SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+            let _ = WTSUnRegisterSessionNotification(h);
+            let _ = DestroyWindow(h);
+        }
     }
     // Gamma::drop restores the original ramp.
 }
