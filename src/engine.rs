@@ -509,15 +509,30 @@ fn run(shared: &Shared) {
         }
 
         // Wait on the message queue instead of sleeping so the hotkey wakes us
-        // at once; the timeout is the tick. Idle ticks are long: when off,
-        // nothing needs sampling, only the UI's toggle/restore flags are polled.
-        let wait_ms = if transitioning {
-            40 // ~25 ramp writes/s is smooth enough for an eased fade
+        // at once. The timeout is the next thing that needs doing (sample, heal,
+        // retarget settle, calibration), never a fixed tick, capped so the
+        // UI's toggle/restore flags and config edits are picked up within
+        // IDLE_TICK. Only a fade needs fast ticks.
+        const IDLE_TICK: Duration = Duration::from_millis(250);
+        let now = Instant::now();
+        let wait = if transitioning {
+            Duration::from_millis(40) // ~25 ramp writes/s is smooth enough for an eased fade
         } else if active {
-            50
+            let mut w = IDLE_TICK.min(next_sample.saturating_duration_since(now));
+            w = w.min(next_heal.saturating_duration_since(now));
+            if let Some((_, since)) = cand {
+                let at = since + Duration::from_millis(cfg.settle_ms as u64);
+                w = w.min(at.saturating_duration_since(now));
+            }
+            if let Some((_, at)) = pending {
+                w = w.min(at.saturating_duration_since(now));
+            }
+            w
         } else {
-            250
+            IDLE_TICK
         };
+        // 5 ms floor: a deadline that already passed must not spin the loop.
+        let wait_ms = wait.as_millis().max(5) as u32;
         unsafe { MsgWaitForMultipleObjects(None, false, wait_ms, QS_HOTKEY | QS_POSTMESSAGE) };
     }
     if let Some(h) = event_hwnd {
