@@ -13,23 +13,23 @@
 use crate::{Config, Shared};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
-    D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
-    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC,
-    DXGI_OUTDUPL_FRAME_INFO,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT, DXGI_ERROR_WAS_STILL_DRAWING,
+    DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Graphics::Gdi::{
@@ -132,8 +132,36 @@ fn run(shared: &Shared) {
     let mut t0 = Instant::now();
     let mut dur_s = 0.001f32;
     let mut last_measured = f32::MIN;
+    // Retarget waiting to prove stable: (blend position, since when).
+    let mut cand: Option<(f32, Instant)> = None;
+
+    // Crash bisection switches: exercise only one half of the GPU/driver work.
+    let no_gamma = std::env::args().any(|a| a == "--no-gamma");
+    let no_capture = std::env::args().any(|a| a == "--no-capture");
+    let mut next_flip = Instant::now();
+    let mut next_write = Instant::now();
+
+    // Wall clock, not Instant: Instant may not advance across sleep, which is
+    // exactly the gap we want to see.
+    let mut last_tick = SystemTime::now();
 
     while shared.running.load(Relaxed) {
+        // Long gap between ticks = the machine slept (or we were frozen). The
+        // display driver resets on resume, so the duplication device and the
+        // display DC are stale: drop them and give the driver a few seconds to
+        // settle instead of hammering it with re-creation while it recovers.
+        let wall = SystemTime::now();
+        if wall.duration_since(last_tick).is_ok_and(|d| d > Duration::from_secs(5)) {
+            let t = Instant::now();
+            cap = None;
+            shared.capture_ok.store(false, Relaxed);
+            next_reinit = t + Duration::from_secs(4);
+            reinit_backoff = Duration::from_secs(2);
+            next_heal = t + Duration::from_secs(6);
+            gamma.reopen();
+        }
+        last_tick = wall;
+
         let mut msg = MSG::default();
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
             if msg.message == WM_HOTKEY {
@@ -180,6 +208,7 @@ fn run(shared: &Shared) {
             start = 1.0;
             target = 1.0;
             last_measured = f32::MIN;
+            cand = None;
         }
 
         // A pending calibration capture keeps sampling alive even while off;
@@ -209,7 +238,16 @@ fn run(shared: &Shared) {
                     c.built_sizes = cfg.zone_sizes;
                 }
             }
-            if cap.is_none() && now >= next_reinit {
+            // --no-capture: no sampling, so fake scene changes to keep the
+            // gamma path busy with real fades.
+            if no_capture && now >= next_flip {
+                next_flip = now + Duration::from_secs(6);
+                start = cur;
+                target = if target > 0.5 { 0.0 } else { 1.0 };
+                t0 = now;
+                dur_s = cfg.transition_ms.max(1) as f32 / 1000.0;
+            }
+            if cap.is_none() && !no_capture && now >= next_reinit {
                 match Capture::new(cfg.zone_sizes) {
                     Ok(c) => {
                         shared.screen_dims.store(
@@ -218,7 +256,6 @@ fn run(shared: &Shared) {
                         );
                         cap = Some(c);
                         shared.capture_ok.store(true, Relaxed);
-                        reinit_backoff = Duration::from_secs(2);
                         // Capture coming back often means the ramp was reset
                         // too (game exit, resume from sleep) — heal now.
                         next_heal = now;
@@ -234,6 +271,7 @@ fn run(shared: &Shared) {
             if let Some(c) = cap.as_mut() {
                 match c.sample() {
                     Ok(Some(medians)) => {
+                        reinit_backoff = Duration::from_secs(2); // capture proven healthy
                         for (slot, m) in shared.zone_medians.iter().zip(&medians) {
                             slot.store(*m as u32, Relaxed);
                         }
@@ -244,19 +282,16 @@ fn run(shared: &Shared) {
                         if (mf - last_measured).abs() >= 3.0 {
                             last_measured = mf;
                             let want = blend_pos(&cfg, mf);
+                            // Don't retarget yet: a new value must hold
+                            // still for cfg.settle_ms first (applied below). Sudden
+                            // swings like a round-start load never reach
+                            // the driver as ramp writes.
                             if (want - target).abs() > 0.005 {
-                                start = cur;
-                                target = want;
-                                t0 = now;
-                                // Moving toward the bright point = the scene
-                                // got brighter: ramp down fast so it doesn't
-                                // glare.
-                                let ms = if want > cur {
-                                    cfg.transition_down_ms
-                                } else {
-                                    cfg.transition_ms
-                                };
-                                dur_s = ms.max(1) as f32 / 1000.0;
+                                if cand.is_none_or(|(w, _)| (w - want).abs() > 0.05) {
+                                    cand = Some((want, now));
+                                }
+                            } else {
+                                cand = None;
                             }
                         }
                     }
@@ -265,12 +300,29 @@ fn run(shared: &Shared) {
                         // Mode change / fullscreen handoff: rebuild duplication.
                         // Mode changes often reset the hardware ramp too, so
                         // heal immediately instead of waiting for the timer.
+                        // The backoff is deliberately not reset: a capture
+                        // that keeps dying right after creation (lock screen,
+                        // UAC, driver reset) must not recreate the device in
+                        // a tight loop.
                         cap = None;
                         shared.capture_ok.store(false, Relaxed);
-                        next_reinit = now + Duration::from_millis(500);
-                        reinit_backoff = Duration::from_secs(2);
+                        next_reinit = now + reinit_backoff;
+                        reinit_backoff = (reinit_backoff * 2).min(Duration::from_secs(30));
                     }
                 }
+            }
+        }
+
+        if let Some((want, since)) = cand {
+            if now.duration_since(since) >= Duration::from_millis(cfg.settle_ms as u64) {
+                cand = None;
+                start = cur;
+                target = want;
+                t0 = now;
+                // Moving toward the bright point = the scene got brighter:
+                // ramp down fast so it doesn't glare.
+                let ms = if want > cur { cfg.transition_down_ms } else { cfg.transition_ms };
+                dur_s = ms.max(1) as f32 / 1000.0;
             }
         }
 
@@ -304,7 +356,7 @@ fn run(shared: &Shared) {
         if now >= next_heal {
             // Only while capture works: with capture broken (exclusive
             // fullscreen) the game owns the ramp — fighting it flickers.
-            if cap.is_some() {
+            if cap.is_some() && !no_gamma {
                 gamma.heal();
             }
             next_heal = now + Duration::from_secs(10);
@@ -320,7 +372,12 @@ fn run(shared: &Shared) {
                 target
             };
             let g = gamma_at(&cfg, cur);
-            gamma.set(g, cfg.black_lift * (1.0 - cur), cfg.white_drop * cur);
+            // Each ramp write is a driver call that can stall a game's present,
+            // so fades are rate-limited; the settled value is always written.
+            if !no_gamma && (!transitioning || now >= next_write) {
+                gamma.set(g, cfg.black_lift * (1.0 - cur), cfg.white_drop * cur);
+                next_write = now + Duration::from_millis(100);
+            }
             shared.gamma_milli.store((g * 1000.0).round() as u32, Relaxed);
             shared.gamma_ok.store(gamma.ok, Relaxed);
         } else {
@@ -331,10 +388,11 @@ fn run(shared: &Shared) {
             start = 1.0;
             target = 1.0;
             last_measured = f32::MIN;
+            cand = None;
         }
 
         std::thread::sleep(Duration::from_millis(if transitioning {
-            16
+            40 // ~25 ramp writes/s is smooth enough for an eased fade
         } else if active {
             50
         } else {
@@ -416,10 +474,24 @@ fn open_gamma_dc() -> (HDC, bool) {
     }
 }
 
+/// Run `f` with a display DC that exists only for the call. Holding a DC on the
+/// display device open for the whole process lifetime keeps a handle into the
+/// display driver even while the boost is off, so every gamma read or write
+/// opens a fresh one and closes it straight away.
+fn with_dc<R>(f: impl FnOnce(HDC) -> R) -> R {
+    let (hdc, owned) = open_gamma_dc();
+    let r = f(hdc);
+    unsafe {
+        if owned {
+            let _ = DeleteDC(hdc);
+        } else {
+            ReleaseDC(None, hdc);
+        }
+    }
+    r
+}
+
 struct Gamma {
-    hdc: HDC,
-    /// True when hdc came from CreateDCW (DeleteDC) rather than GetDC (ReleaseDC).
-    owned_dc: bool,
     original: [u16; 768],
     /// The exact ramp we last wrote to the hardware (original when neutral).
     last_written: [u16; 768],
@@ -433,11 +505,10 @@ struct Gamma {
 
 impl Gamma {
     fn new() -> Self {
-        let (hdc, owned_dc) = open_gamma_dc();
         let mut captured = [0u16; 768];
-        unsafe {
+        with_dc(|hdc| unsafe {
             let _ = GetDeviceGammaRamp(hdc, captured.as_mut_ptr() as *mut _);
-        }
+        });
         let dir = crate::config_dir();
         let marker = dir.as_ref().is_some_and(|d| d.join(MARKER_FILE).exists());
         let mut original = captured;
@@ -450,7 +521,7 @@ impl Gamma {
             // Night Light, …) — refresh the saved copy.
             let _ = write_ramp(&d.join(RAMP_FILE), &captured);
         }
-        Self { hdc, owned_dc, original, last_written: original, applied: None, dir, marker, ok: true }
+        Self { original, last_written: original, applied: None, dir, marker, ok: true }
     }
 
     /// `lift` raises black and `drop` lowers white, both on the 0-255 scale.
@@ -474,18 +545,52 @@ impl Gamma {
                 ramp[i + c * 256] = (lo + v * (hi - lo) / 65535.0).round().clamp(0.0, 65535.0) as u16;
             }
         }
-        self.ok = unsafe { SetDeviceGammaRamp(self.hdc, ramp.as_ptr() as *const _) }.as_bool();
+        // Each write reprograms the display LUT inside the driver; skip it
+        // when rounding made the ramp identical to what is already there.
+        if self.applied.is_some() && ramp == self.last_written {
+            self.applied = Some((g, lift, drop));
+            return;
+        }
+        let t = Instant::now();
+        self.ok = with_dc(|hdc| unsafe { SetDeviceGammaRamp(hdc, ramp.as_ptr() as *const _) }.as_bool());
+        self.log_write("set", t.elapsed());
         self.last_written = ramp;
         self.applied = Some((g, lift, drop));
         let neutral = (g - 1.0).abs() <= 0.001 && lift < 0.05 && drop < 0.05;
         self.set_marker(self.ok && !neutral);
     }
 
+    /// Diagnostics: every ramp write is appended to gamma_timing.log as
+    /// "unix_ms kind took_ms" (kind = set | heal | restore), so a GPU crash can
+    /// be lined up against exactly what we did and why. Rotates at 200 KB.
+    fn log_write(&self, kind: &str, took: Duration) {
+        use std::io::Write;
+        let Some(d) = &self.dir else { return };
+        let path = d.join("gamma_timing.log");
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 200_000) {
+            let _ = std::fs::rename(&path, d.join("gamma_timing.old.log"));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            let _ = writeln!(f, "{ms} {kind} {:.1}", took.as_secs_f64() * 1000.0);
+        }
+    }
+
+    /// Forget what was applied (the driver reset on resume may have dropped
+    /// it) so an active boost is rewritten on the next tick.
+    fn reopen(&mut self) {
+        self.applied = None;
+    }
+
     fn restore(&mut self) {
         if self.applied.is_some() || self.marker {
-            unsafe {
-                let _ = SetDeviceGammaRamp(self.hdc, self.original.as_ptr() as *const _);
-            }
+            let t = Instant::now();
+            with_dc(|hdc| unsafe {
+                let _ = SetDeviceGammaRamp(hdc, self.original.as_ptr() as *const _);
+            });
+            self.log_write("restore", t.elapsed());
             self.last_written = self.original;
             self.applied = None;
             self.ok = true;
@@ -500,17 +605,19 @@ impl Gamma {
     ///   the new original so future boosts compose through it.
     fn heal(&mut self) {
         let mut hw = [0u16; 768];
-        if !unsafe { GetDeviceGammaRamp(self.hdc, hw.as_mut_ptr() as *mut _) }.as_bool() {
+        if !with_dc(|hdc| unsafe { GetDeviceGammaRamp(hdc, hw.as_mut_ptr() as *mut _) }.as_bool()) {
             return;
         }
         if self.applied.is_some() {
-            if hw != self.last_written {
-                self.ok = unsafe {
-                    SetDeviceGammaRamp(self.hdc, self.last_written.as_ptr() as *const _)
+            if !ramps_close(&hw, &self.last_written) {
+                let t = Instant::now();
+                self.ok = with_dc(|hdc| unsafe {
+                    SetDeviceGammaRamp(hdc, self.last_written.as_ptr() as *const _)
                 }
-                .as_bool();
+                .as_bool());
+                self.log_write("heal", t.elapsed());
             }
-        } else if !self.marker && hw != self.original {
+        } else if !self.marker && !ramps_close(&hw, &self.original) {
             self.original = hw;
             self.last_written = hw;
             if let Some(d) = &self.dir {
@@ -537,6 +644,13 @@ impl Gamma {
     }
 }
 
+/// Drivers quantize ramps (AMD keeps fewer than 16 bits), so a read-back never
+/// equals what was written. Treat ~1.5% of full scale as "the same ramp" or
+/// heal would rewrite the hardware every cycle.
+fn ramps_close(a: &[u16; 768], b: &[u16; 768]) -> bool {
+    a.iter().zip(b).all(|(x, y)| x.abs_diff(*y) <= 1024)
+}
+
 fn write_ramp(path: &std::path::Path, ramp: &[u16; 768]) -> std::io::Result<()> {
     let mut bytes = Vec::with_capacity(1536);
     for v in ramp {
@@ -560,13 +674,6 @@ fn read_ramp(path: &std::path::Path) -> Option<[u16; 768]> {
 impl Drop for Gamma {
     fn drop(&mut self) {
         self.restore();
-        unsafe {
-            if self.owned_dc {
-                let _ = DeleteDC(self.hdc);
-            } else {
-                ReleaseDC(None, self.hdc);
-            }
-        }
     }
 }
 
@@ -574,10 +681,11 @@ impl Drop for Gamma {
 // Screen sampling (DXGI Desktop Duplication, primary output)
 // ---------------------------------------------------------------------------
 
-/// Staging atlas cell per zone: a 6x6 grid of 16px patches. Sampling cost is
+/// Staging atlas cell per zone: a 4x4 grid of 16px patches (80 GPU copies per
+/// sample in total — fewer commands for the driver than a denser grid). Sampling cost is
 /// therefore constant regardless of configured zone size.
-const CELL: u32 = 96;
-const GRID: u32 = 6;
+const CELL: u32 = 64;
+const GRID: u32 = 4;
 const PATCH: u32 = 16;
 
 struct Capture {
@@ -615,6 +723,11 @@ impl Capture {
             )?;
             let device = device.unwrap();
             let ctx = ctx.unwrap();
+            // Lowest GPU scheduling priority: our tiny copies must never queue
+            // ahead of a game's work. Best effort — ignored if unsupported.
+            if let Ok(dxgi) = device.cast::<IDXGIDevice>() {
+                let _ = dxgi.SetGPUThreadPriority(-7);
+            }
 
             let output1: IDXGIOutput1 = output.cast()?;
             let dupl = output1.DuplicateOutput(&device)?;
@@ -684,7 +797,7 @@ impl Capture {
                     return Err(e);
                 }
             };
-            // 36 small patches spread evenly across each zone, packed into
+            // 16 small patches spread evenly across each zone, packed into
             // its atlas cell — constant cost for any zone size.
             for (i, &(zx, zy, z)) in self.rects.iter().enumerate() {
                 let spread = z.saturating_sub(PATCH);
@@ -716,8 +829,28 @@ impl Capture {
             drop(tex);
             let _ = self.dupl.ReleaseFrame();
 
+            // A blocking Map waits on the GPU forever if the driver is mid-reset
+            // (sleep/resume, TDR), hanging this thread and the quit join. Poll
+            // with DO_NOT_WAIT for a bounded time, then fail so the caller
+            // rebuilds the capture.
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.ctx.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let mut tries = 0;
+            loop {
+                match self.ctx.Map(
+                    &self.staging,
+                    0,
+                    D3D11_MAP_READ,
+                    D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                    Some(&mut mapped),
+                ) {
+                    Ok(()) => break,
+                    Err(e) if e.code() == DXGI_ERROR_WAS_STILL_DRAWING && tries < 25 => {
+                        tries += 1;
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             let base = mapped.pData as *const u8;
             let pitch = mapped.RowPitch as usize;
 

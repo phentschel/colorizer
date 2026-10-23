@@ -31,6 +31,9 @@ pub struct Config {
     pub transition_down_ms: u32,
     /// Screen sampling interval.
     pub sample_ms: u32,
+    /// How long a new brightness reading must hold still before the gamma
+    /// ramp is retargeted. 0 = react immediately.
+    pub settle_ms: u32,
     /// Influence of each zone (center, TL, TR, BL, BR), 0-10.
     pub zone_weights: [u32; 5],
     /// Side length of each zone as % of the smaller screen dimension, 2-20.
@@ -64,6 +67,7 @@ impl Default for Config {
             transition_ms: 800,
             transition_down_ms: 200,
             sample_ms: 500,
+            settle_ms: 2000,
             zone_weights: [2, 1, 1, 1, 1],
             zone_sizes: [8; 5],
             hotkey_mods: MOD_CTRL | MOD_ALT,
@@ -204,9 +208,9 @@ pub fn save_config(cfg: &Config) {
     let Some(path) = config_path() else { return };
     let list = |a: &[u32; 5]| a.map(|v| v.to_string()).join(",");
     let s = format!(
-        "enabled={}\ndark_point={}\nbright_point={}\ndark_gamma={}\nbright_gamma={}\nblack_lift={}\nwhite_drop={}\ntransition_ms={}\ntransition_down_ms={}\nsample_ms={}\nzone_weights={}\nzone_sizes={}\nhotkey_mods={}\nhotkey_vk={}\n",
+        "enabled={}\ndark_point={}\nbright_point={}\ndark_gamma={}\nbright_gamma={}\nblack_lift={}\nwhite_drop={}\ntransition_ms={}\ntransition_down_ms={}\nsample_ms={}\nsettle_ms={}\nzone_weights={}\nzone_sizes={}\nhotkey_mods={}\nhotkey_vk={}\n",
         cfg.enabled, cfg.dark_point, cfg.bright_point, cfg.dark_gamma, cfg.bright_gamma,
-        cfg.black_lift, cfg.white_drop, cfg.transition_ms, cfg.transition_down_ms, cfg.sample_ms, list(&cfg.zone_weights), list(&cfg.zone_sizes),
+        cfg.black_lift, cfg.white_drop, cfg.transition_ms, cfg.transition_down_ms, cfg.sample_ms, cfg.settle_ms, list(&cfg.zone_weights), list(&cfg.zone_sizes),
         cfg.hotkey_mods, cfg.hotkey_vk
     );
     let _ = std::fs::write(path, s);
@@ -231,6 +235,7 @@ fn load_config() -> Config {
                 cfg.transition_down_ms = v.trim().parse().unwrap_or(cfg.transition_down_ms)
             }
             "sample_ms" => cfg.sample_ms = v.trim().parse().unwrap_or(cfg.sample_ms),
+            "settle_ms" => cfg.settle_ms = v.trim().parse().unwrap_or(cfg.settle_ms),
             "zone_weights" => parse_list(v, &mut cfg.zone_weights),
             "zone_sizes" => parse_list(v, &mut cfg.zone_sizes),
             "hotkey_mods" => cfg.hotkey_mods = v.trim().parse().unwrap_or(cfg.hotkey_mods),
@@ -261,6 +266,7 @@ fn sanitize(cfg: &mut Config) {
     cfg.transition_ms = cfg.transition_ms.clamp(0, 5000);
     cfg.transition_down_ms = cfg.transition_down_ms.clamp(0, 5000);
     cfg.sample_ms = cfg.sample_ms.clamp(100, 5000);
+    cfg.settle_ms = cfg.settle_ms.clamp(0, 10000);
     for w in &mut cfg.zone_weights {
         *w = (*w).min(10);
     }
@@ -295,6 +301,7 @@ mod tests {
             transition_ms: 99999,
             transition_down_ms: 99999,
             sample_ms: 1,
+            settle_ms: 99999,
             zone_weights: [99; 5],
             zone_sizes: [0; 5],
             hotkey_mods: MOD_CTRL | MOD_ALT,
@@ -309,6 +316,7 @@ mod tests {
         assert_eq!(cfg.white_drop, 0.0);
         assert_eq!(cfg.transition_ms, 5000);
         assert_eq!(cfg.sample_ms, 100);
+        assert_eq!(cfg.settle_ms, 10000);
         assert_eq!(cfg.zone_weights, [10; 5]);
         assert_eq!(cfg.zone_sizes, [2; 5]);
     }
@@ -711,6 +719,12 @@ impl eframe::App for App {
                     .step_by(50.0),
             );
             ui.add(
+                egui::Slider::new(&mut cfg.settle_ms, 0..=10000)
+                    .text("Settle delay (ms)")
+                    .step_by(100.0),
+            );
+            ui.label("A brightness change waits this long to hold steady before the ramp moves. Higher = gentler on the driver (round-start loads), lower = faster reaction.");
+            ui.add(
                 egui::Slider::new(&mut cfg.sample_ms, 100..=5000)
                     .text("Sample interval (ms)")
                     .step_by(50.0),
@@ -864,6 +878,83 @@ fn attach_console() {
     }
 }
 
+/// `--headless`: engine + tray menu only, no settings window. The window brings
+/// an OpenGL context into the AMD driver and redraws on a timer; this mode
+/// shows whether that matters. Settings come from config.txt, edited by hand.
+fn run_headless(shared: Arc<Shared>, mut worker: Option<std::thread::JoinHandle<()>>) {
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, Submenu};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, PostQuitMessage, TranslateMessage, MSG,
+    };
+
+    let enabled = shared.cfg.lock().unwrap().enabled;
+    let toggle = CheckMenuItem::new("Auto brightness", true, enabled, None);
+    let pause30 = MenuItem::new("30 minutes", true, None);
+    let pause60 = MenuItem::new("1 hour", true, None);
+    let pause120 = MenuItem::new("2 hours", true, None);
+    let pause_menu = Submenu::new("Pause", true);
+    let _ = pause_menu.append_items(&[&pause30, &pause60, &pause120]);
+    let resume_item = MenuItem::new("Resume now", true, None);
+    let quit = MenuItem::new("Quit", true, None);
+    let menu = Menu::new();
+    let _ = menu.append_items(&[&toggle, &pause_menu, &resume_item, &quit]);
+
+    let (toggle_id, p30, p60, p120, resume_id, quit_id) = (
+        toggle.id().clone(),
+        pause30.id().clone(),
+        pause60.id().clone(),
+        pause120.id().clone(),
+        resume_item.id().clone(),
+        quit.id().clone(),
+    );
+    {
+        let shared = shared.clone();
+        MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+            let id = e.id();
+            if *id == toggle_id {
+                let snap = {
+                    let mut c = shared.cfg.lock().unwrap();
+                    c.enabled = !c.enabled;
+                    *c
+                };
+                if snap.enabled {
+                    *shared.pause_until.lock().unwrap() = None;
+                }
+                save_config(&snap);
+            } else if *id == p30 {
+                pause_for(&shared, 30);
+            } else if *id == p60 {
+                pause_for(&shared, 60);
+            } else if *id == p120 {
+                pause_for(&shared, 120);
+            } else if *id == resume_id {
+                resume(&shared);
+            } else if *id == quit_id {
+                unsafe { PostQuitMessage(0) };
+            }
+        }));
+    }
+    let _tray = tray_icon::TrayIconBuilder::new()
+        .with_tooltip("AutoBright (headless)")
+        .with_icon(tray_icon(enabled))
+        .with_menu(Box::new(menu))
+        .build()
+        .ok();
+
+    // The tray's hidden window needs this thread's message loop.
+    let mut msg = MSG::default();
+    while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    shared.running.store(false, Ordering::Relaxed);
+    if let Some(h) = worker.take() {
+        let _ = h.join(); // worker restores the original gamma ramp on exit
+    }
+}
+
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|a| a == "--probe") {
         attach_console();
@@ -916,6 +1007,11 @@ fn main() -> eframe::Result<()> {
         calib_result: Mutex::new(None),
     });
     let worker = Some(engine::spawn(shared.clone()));
+
+    if std::env::args().any(|a| a == "--headless") {
+        run_headless(shared, worker);
+        return Ok(());
+    }
 
     let start_hidden = std::env::args().any(|a| a == "--hidden");
     let options = eframe::NativeOptions {
